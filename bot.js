@@ -14,6 +14,7 @@ const ALLOWED_GROUP_IDS = process.env.ALLOWED_GROUP_IDS ? process.env.ALLOWED_GR
 const REFERRAL_CHANNEL_ID = process.env.REFERRAL_CHANNEL_ID || null;
 const PROXY_URL = process.env.PROXY_URL || null;
 const TELEGRAM_API_URL = process.env.TELEGRAM_API_URL || 'https://api.telegram.org';
+const CHANNEL_INVITE_LINK = process.env.CHANNEL_INVITE_LINK || null;
 
 if (!BOT_TOKEN) {
     console.error('❌ FATAL ERROR: BOT_TOKEN not found in .env file!');
@@ -24,6 +25,7 @@ const app = express();
 const employees = {};
 const pendingUsers = {};
 const verifiedUsers = new Set();
+const manuallyVerified = new Set(); // For admin manual verification
 
 // ✅ Auto-verify admins
 ADMIN_IDS.forEach(adminId => {
@@ -354,36 +356,56 @@ async function isUserMemberOfChannel(userId) {
         return true;
     }
 
+    // ✅ Check if manually verified by admin
+    if (manuallyVerified.has(userId)) {
+        console.log(`[VERIFICATION] User ${userId} manually verified by admin`);
+        return true;
+    }
+
     try {
-        // Try multiple methods to check membership
-        
-        // Method 1: Direct getChatMember (works for public channels and if bot is admin)
+        // Clean the channel ID (remove @ if present)
+        let channelId = REFERRAL_CHANNEL_ID;
+        if (channelId.startsWith('@')) {
+            channelId = channelId.substring(1);
+        }
+
+        // Method 1: Try getChatMember with username
         try {
-            const chatMember = await bot.getChatMember(REFERRAL_CHANNEL_ID, userId);
+            const chatMember = await bot.getChatMember(`@${channelId}`, userId);
             const isMember = chatMember.status !== 'left' && chatMember.status !== 'kicked';
             console.log(`[VERIFICATION] User ${userId} channel member (method 1): ${isMember}`);
             if (isMember) return true;
         } catch (err) {
-            console.log(`[VERIFICATION] Method 1 failed for user ${userId}:`, err.message);
+            console.log(`[VERIFICATION] Method 1 failed:`, err.message);
         }
 
-        // Method 2: Try to get chat and check if user is in the chat list (for public channels)
+        // Method 2: Try with channel ID if we have it
+        if (GROUP_CHAT_ID && GROUP_CHAT_ID.startsWith('-100')) {
+            try {
+                const chatMember = await bot.getChatMember(GROUP_CHAT_ID, userId);
+                // Check if user is in the linked group/channel
+                if (chatMember && chatMember.status !== 'left' && chatMember.status !== 'kicked') {
+                    console.log(`[VERIFICATION] User ${userId} found in linked group`);
+                    return true;
+                }
+            } catch (err) {
+                console.log(`[VERIFICATION] Method 2 failed:`, err.message);
+            }
+        }
+
+        // Method 3: Check if user has started the bot (they're in the chat)
         try {
-            const chat = await bot.getChat(REFERRAL_CHANNEL_ID);
-            if (chat && chat.username) {
-                // Try to get the user's chat member status using the chat ID
-                const chatMember = await bot.getChatMember(chat.id, userId);
-                const isMember = chatMember.status !== 'left' && chatMember.status !== 'kicked';
-                console.log(`[VERIFICATION] User ${userId} channel member (method 2): ${isMember}`);
-                if (isMember) return true;
+            const chat = await bot.getChat(userId);
+            if (chat && chat.id) {
+                // User has interacted with bot, we can consider them semi-verified
+                console.log(`[VERIFICATION] User ${userId} has interacted with bot`);
+                // Don't auto-verify just because they interacted
             }
         } catch (err) {
-            console.log(`[VERIFICATION] Method 2 failed for user ${userId}:`, err.message);
+            console.log(`[VERIFICATION] Method 3 failed:`, err.message);
         }
 
-        // Method 3: If channel is private and bot is not admin, we can't check
-        // In this case, we'll allow the user if they clicked the verify button
-        console.log(`[VERIFICATION] Could not verify user ${userId} membership. Channel might be private or bot lacks permissions.`);
+        console.log(`[VERIFICATION] Could not verify user ${userId} membership.`);
         return false;
     } catch (error) {
         console.log(`[VERIFICATION] Failed to check membership for user ${userId}:`, error.message);
@@ -418,16 +440,29 @@ async function sendVerificationRequest(chatId, userId) {
         return;
     }
 
+    // ✅ Skip for manually verified users
+    if (manuallyVerified.has(userId)) {
+        console.log(`[VERIFICATION] User ${userId} manually verified, skipping`);
+        verifiedUsers.add(userId);
+        return;
+    }
+
+    const channelName = REFERRAL_CHANNEL_ID.replace('@', '');
+    const inviteLink = CHANNEL_INVITE_LINK || `https://t.me/${channelName}`;
+    
     let message = '🔐 *Verification Required*\n\n';
     message += 'To use this bot, you must join our referral channel:\n';
-    message += `📢 Channel: [Click here to join](https://t.me/${REFERRAL_CHANNEL_ID.replace('@', '')})\n\n`;
-    message += 'After joining, click the button below to verify.';
+    message += `📢 Channel: [${channelName}](${inviteLink})\n\n`;
+    message += '1️⃣ Click "Join Channel" below\n';
+    message += '2️⃣ Join the channel\n';
+    message += '3️⃣ Return here and click "✅ I have joined!"\n\n';
+    message += '⚠️ *Note:* If verification fails, contact an admin.';
     
     const verificationKeyboard = {
         reply_markup: {
             inline_keyboard: [
-                [{ text: '✅ I have joined!', callback_data: 'verify_membership' }],
-                [{ text: '📢 Join Channel', url: `https://t.me/${REFERRAL_CHANNEL_ID.replace('@', '')}` }]
+                [{ text: '📢 Join Channel', url: inviteLink }],
+                [{ text: '✅ I have joined!', callback_data: 'verify_membership' }]
             ]
         }
     };
@@ -449,6 +484,13 @@ async function verifyUserAndGroup(msg) {
     // ✅ Check if user is admin (skip all verification)
     if (userId && ADMIN_IDS.includes(userId)) {
         console.log(`[VERIFICATION] Admin ${userId} auto-verified`);
+        return true;
+    }
+    
+    // ✅ Check if manually verified
+    if (userId && manuallyVerified.has(userId)) {
+        console.log(`[VERIFICATION] User ${userId} manually verified`);
+        verifiedUsers.add(userId);
         return true;
     }
     
@@ -502,18 +544,12 @@ async function verifyUserAndGroup(msg) {
     return false;
 }
 
-// ==================== NOTIFICATION FUNCTIONS ====================
+// ==================== NOTIFICATION FUNCTIONS - ONLY TO ADMINS ====================
 
-async function sendNotification(message, parseMode = 'Markdown') {
+async function sendNotification(message, parseMode = 'Markdown', onlyAdmins = true) {
     let sent = false;
-    if (GROUP_CHAT_ID) {
-        try {
-            await bot.sendMessage(GROUP_CHAT_ID, message, { parse_mode: parseMode });
-            sent = true;
-        } catch (err) {
-            console.error(`Failed to send to group:`, err.message);
-        }
-    }
+    
+    // Always send to admins
     for (const adminId of ADMIN_IDS) {
         if (adminId && adminId.trim()) {
             try {
@@ -526,9 +562,30 @@ async function sendNotification(message, parseMode = 'Markdown') {
             }
         }
     }
+    
+    // Only send to group if explicitly requested and not only admins
+    if (!onlyAdmins && GROUP_CHAT_ID) {
+        try {
+            await bot.sendMessage(GROUP_CHAT_ID, message, { parse_mode: parseMode });
+            sent = true;
+        } catch (err) {
+            console.error(`Failed to send to group:`, err.message);
+        }
+    }
+    
     if (!sent) {
         console.log('📝 Notification:', message.substring(0, 100));
     }
+}
+
+// Admin-only notification
+function sendAdminNotification(message, parseMode = 'Markdown') {
+    return sendNotification(message, parseMode, true);
+}
+
+// Public notification (to group if configured)
+function sendPublicNotification(message, parseMode = 'Markdown') {
+    return sendNotification(message, parseMode, false);
 }
 
 function mentionUser(name, telegramId) {
@@ -592,7 +649,8 @@ function checkActivityTimeouts() {
                 const userMention = mentionUser(emp.name, telegramId);
                 const reminderMessage = `⚠️ ACTIVITY REMINDER\n\n${userMention} has been on ${activityDisplay} for over 15 minutes!\n\n⏱️ Duration: ${durationFormatted}\n\nPlease click 返回 (Back) to continue working.`;
                 bot.sendMessage(emp.currentChatId || telegramId, reminderMessage, { parse_mode: 'Markdown' }).catch(() => {});
-                sendNotification(`⚠️ Activity Alert\n\n${userMention} has been on ${activityDisplay} for ${durationFormatted}`, 'Markdown');
+                // ✅ Only send to admins
+                sendAdminNotification(`⚠️ Activity Alert\n\n${userMention} has been on ${activityDisplay} for ${durationFormatted}`, 'Markdown');
                 emp.reminderSent = true;
             }
         }
@@ -611,7 +669,8 @@ function checkLateArrivals() {
             if (isUserLate(emp.workStart)) {
                 const lateDurationText = formatDurationWithSeconds(getLateDuration(emp.workStart));
                 const userMention = mentionUser(emp.name, telegramId);
-                sendNotification(`⚠️ LATE ARRIVAL\n\n${userMention} started work late!\n⏱️ Late by: ${lateDurationText}`, 'Markdown');
+                // ✅ Only send to admins
+                sendAdminNotification(`⚠️ LATE ARRIVAL\n\n${userMention} started work late!\n⏱️ Late by: ${lateDurationText}`, 'Markdown');
                 emp.lateNotified = true;
                 console.log(`[LATE] ${emp.name} - ${lateDurationText}`);
             }
@@ -641,6 +700,70 @@ const mainKeyboard = {
     }
 };
 
+// ==================== ADMIN COMMANDS ====================
+
+// Manual verification for users
+bot.onText(/\/verify (\d+)/, async (msg, match) => {
+    const userId = msg.from.id.toString();
+    const targetUserId = match[1];
+    
+    if (!ADMIN_IDS.includes(userId)) {
+        await bot.sendMessage(msg.chat.id, '❌ Admin only command.');
+        return;
+    }
+    
+    manuallyVerified.add(targetUserId);
+    verifiedUsers.add(targetUserId);
+    delete pendingUsers[targetUserId];
+    
+    await bot.sendMessage(msg.chat.id, `✅ User ${targetUserId} has been manually verified.`);
+    
+    try {
+        await bot.sendMessage(targetUserId, '✅ You have been manually verified by an admin! You can now use the bot.\n\nClick /start to begin.');
+    } catch (err) {
+        console.log(`Failed to notify user ${targetUserId}:`, err.message);
+    }
+});
+
+// Unverify a user
+bot.onText(/\/unverify (\d+)/, async (msg, match) => {
+    const userId = msg.from.id.toString();
+    const targetUserId = match[1];
+    
+    if (!ADMIN_IDS.includes(userId)) {
+        await bot.sendMessage(msg.chat.id, '❌ Admin only command.');
+        return;
+    }
+    
+    manuallyVerified.delete(targetUserId);
+    verifiedUsers.delete(targetUserId);
+    
+    await bot.sendMessage(msg.chat.id, `❌ User ${targetUserId} has been unverified.`);
+});
+
+// List all verified users
+bot.onText(/\/listverified/, async (msg) => {
+    const userId = msg.from.id.toString();
+    
+    if (!ADMIN_IDS.includes(userId)) {
+        await bot.sendMessage(msg.chat.id, '❌ Admin only command.');
+        return;
+    }
+    
+    let message = '*Verified Users:*\n\n';
+    message += `Total: ${verifiedUsers.size}\n\n`;
+    message += 'User IDs:\n';
+    const users = Array.from(verifiedUsers).slice(0, 50);
+    users.forEach(id => {
+        message += `- ${id}\n`;
+    });
+    if (verifiedUsers.size > 50) {
+        message += `\n... and ${verifiedUsers.size - 50} more`;
+    }
+    
+    await bot.sendMessage(msg.chat.id, message, { parse_mode: 'Markdown' });
+});
+
 // ==================== CALLBACK QUERY HANDLER ====================
 
 bot.on('callback_query', async (callbackQuery) => {
@@ -662,6 +785,18 @@ bot.on('callback_query', async (callbackQuery) => {
             return;
         }
 
+        // ✅ Check manual verification
+        if (manuallyVerified.has(userId)) {
+            verifiedUsers.add(userId);
+            delete pendingUsers[userId];
+            await bot.answerCallbackQuery(callbackQuery.id, '✅ Verified successfully!');
+            await bot.sendMessage(chatId, '✅ *Verification Successful!*\n\nYou can now use the bot. Click /start to begin.', { 
+                parse_mode: 'Markdown',
+                ...mainKeyboard 
+            });
+            return;
+        }
+
         // ✅ If no channel is configured, auto-verify
         if (!REFERRAL_CHANNEL_ID) {
             verifiedUsers.add(userId);
@@ -673,6 +808,9 @@ bot.on('callback_query', async (callbackQuery) => {
             });
             return;
         }
+
+        // Show loading
+        await bot.answerCallbackQuery(callbackQuery.id, '⏳ Checking your membership...');
 
         const isMember = await isUserMemberOfChannel(userId);
         
@@ -690,25 +828,28 @@ bot.on('callback_query', async (callbackQuery) => {
         } else {
             await bot.answerCallbackQuery(callbackQuery.id, '❌ Verification failed. Please try again.');
             
-            // Give the user another option - manual verification by admin
-            const manualMessage = `⚠️ *Unable to verify your membership automatically.*\n\n` +
+            // Give detailed instructions
+            const failMessage = `⚠️ *Unable to verify your membership automatically.*\n\n` +
                 `Please try these steps:\n` +
-                `1. Make sure you've joined the channel: @${REFERRAL_CHANNEL_ID.replace('@', '')}\n` +
-                `2. Wait a few seconds and click the "I have joined" button again\n` +
-                `3. If it still doesn't work, contact the admin for manual verification.\n\n` +
-                `*Admin ID:* ${ADMIN_IDS.join(', ')}`;
+                `1️⃣ Click the "Join Channel" button below\n` +
+                `2️⃣ Join the channel\n` +
+                `3️⃣ Wait 5-10 seconds\n` +
+                `4️⃣ Click the "✅ I have joined!" button again\n\n` +
+                `*Still having issues?*\n` +
+                `Contact an admin for manual verification.\n\n` +
+                `Admins: ${ADMIN_IDS.join(', ')}`;
             
-            await bot.sendMessage(chatId, manualMessage, { parse_mode: 'Markdown' });
+            await bot.sendMessage(chatId, failMessage, { parse_mode: 'Markdown' });
             
             // Send notification to admins about verification issue
-            if (ADMIN_IDS.length > 0) {
-                const adminNotify = `⚠️ *Verification Issue*\n\n` +
-                    `User ID: ${userId}\n` +
-                    `Name: ${callbackQuery.from.first_name}\n` +
-                    `Failed to verify channel membership.\n\n` +
-                    `Please manually verify this user or check the channel settings.`;
-                await sendNotification(adminNotify, 'Markdown');
-            }
+            sendAdminNotification(
+                `⚠️ *Verification Issue*\n\n` +
+                `User: ${callbackQuery.from.first_name}\n` +
+                `User ID: ${userId}\n` +
+                `Failed to verify channel membership.\n\n` +
+                `Use /verify ${userId} to manually verify this user.`,
+                'Markdown'
+            );
         }
     }
 });
@@ -730,6 +871,11 @@ Activity Limit: 15 minutes
 /mytime - Check Mexico time
 /help - Show this message
 
+*Admin Commands:*
+/verify [user_id] - Manually verify a user
+/unverify [user_id] - Unverify a user
+/listverified - List all verified users
+
 *Buttons:*
 上班 - Start work
 下班 - Finish work
@@ -739,7 +885,8 @@ Activity Limit: 15 minutes
 *Verification:*
 - Groups: Must be allowed by admin
 - Personal: Must join referral channel
-- Admins: Auto-verified`;
+- Admins: Auto-verified
+- Admins can manually verify users with /verify`;
     try {
         await bot.sendMessage(chatId, helpMessage, { parse_mode: 'Markdown' });
     } catch (error) {
@@ -776,7 +923,7 @@ bot.onText(/\/start/, async (msg) => {
         employees[telegramId].currentChatId = chatId;
         const welcomeMessage = `Welcome ${name}!\n\nWork Hours: 8:00 AM Mexico Time\nActivity Limit: 15 minutes\n\nUse the buttons below to track your work.`;
         await bot.sendMessage(chatId, welcomeMessage, mainKeyboard);
-        await sendNotification(`User Active\n\n${mentionUser(name, telegramId)} started using the bot.`, 'Markdown');
+        await sendAdminNotification(`User Active\n\n${mentionUser(name, telegramId)} started using the bot.`, 'Markdown');
     } catch (error) {
         console.error('Error in /start:', error);
         try {
@@ -974,7 +1121,8 @@ bot.onText(/上班/, async (msg) => {
             if (late) {
                 const lateDurationText = formatDurationWithSeconds(getLateDuration(now));
                 response += `\n\n⚠️ You are late!\n⏱️ Late by: ${lateDurationText}`;
-                await sendNotification(`⚠️ LATE ARRIVAL\n\n${mentionUser(name, telegramId)} started work at ${actualTimeFormatted}\nLate by: ${lateDurationText}`, 'Markdown');
+                // ✅ Only send to admins
+                await sendAdminNotification(`⚠️ LATE ARRIVAL\n\n${mentionUser(name, telegramId)} started work at ${actualTimeFormatted}\nLate by: ${lateDurationText}`, 'Markdown');
             } else {
                 console.log(`[ON TIME] ${name} started at ${actualTimeFormatted}`);
             }
@@ -1030,6 +1178,9 @@ bot.onText(/下班/, async (msg) => {
             
             const response = `✅ ${name} finished work\n\n📊 Work Summary:\n⏱️ Work Duration: ${formatDurationWithSeconds(workDurationMs)}\n⏱️ Break Time: ${formatDurationWithSeconds(totalBreaks)}`;
             await bot.sendMessage(chatId, response, { parse_mode: 'Markdown', ...mainKeyboard });
+            
+            // ✅ Send summary only to admins
+            await sendAdminNotification(`📊 *Work Summary*\n\n${mentionUser(name, telegramId)}\n⏱️ Work Duration: ${formatDurationWithSeconds(workDurationMs)}\n⏱️ Break Time: ${formatDurationWithSeconds(totalBreaks)}`, 'Markdown');
         } catch (error) {
             console.error('Error in 下班:', error);
             try {
@@ -1112,6 +1263,9 @@ bot.onText(/返回/, async (msg) => {
             
             const response = `✅ ${name} returned\n\n📊 Activity: ${activityDisplay}\n⏱️ Duration: ${formatDurationWithSeconds(durationMs)}`;
             await bot.sendMessage(chatId, response, { parse_mode: 'Markdown', ...mainKeyboard });
+            
+            // ✅ Send break summary only to admins
+            await sendAdminNotification(`⏱️ *Break Summary*\n\n${mentionUser(name, telegramId)}\n📊 ${activityDisplay}: ${formatDurationWithSeconds(durationMs)}`, 'Markdown');
         } catch (error) {
             console.error('Error in 返回:', error);
             try {
