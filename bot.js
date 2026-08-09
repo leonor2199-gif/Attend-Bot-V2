@@ -8,10 +8,8 @@ const dns = require('dns');
 // ==================== CONFIGURATION FROM .env ====================
 const BOT_TOKEN = process.env.BOT_TOKEN;
 const SUPER_ADMIN_IDS = process.env.SUPER_ADMIN_IDS ? process.env.SUPER_ADMIN_IDS.split(',').map(id => id.trim()) : [];
-const ADMIN_IDS = process.env.ADMIN_IDS ? process.env.ADMIN_IDS.split(',').map(id => id.trim()) : [];
-const GROUP_CHAT_ID = process.env.GROUP_CHAT_ID || null;
 const PORT = process.env.PORT || 3000;
-const ALLOWED_GROUP_IDS = process.env.ALLOWED_GROUP_IDS ? process.env.ALLOWED_GROUP_IDS.split(',').map(id => id.trim()) : [];
+const GROUP_CHAT_ID = process.env.GROUP_CHAT_ID || null;
 const REFERRAL_CHANNEL_ID = process.env.REFERRAL_CHANNEL_ID || null;
 const PROXY_URL = process.env.PROXY_URL || null;
 const TELEGRAM_API_URL = process.env.TELEGRAM_API_URL || 'https://api.telegram.org';
@@ -26,20 +24,20 @@ const app = express();
 const employees = {};
 const pendingUsers = {};
 const verifiedUsers = new Set();
-const manuallyVerified = new Set(); // For admin manual verification
+const manuallyVerified = new Set();
+
+// ==================== ADMIN CONFIGURATION ====================
+// Super admin can see everything
+const superAdmins = new Set(SUPER_ADMIN_IDS);
+
+// Normal admins: each can only create ONE group
+const normalAdmins = new Map(); // adminId -> groupId (only one group per admin)
+const adminGroups = new Map(); // groupId -> adminId (which admin owns this group)
+const approvedGroups = new Set(); // Groups approved by admins
 const pendingGroups = {}; // Groups waiting for approval
-const approvedGroups = new Set(); // Groups approved by admin
 
-// Admin configuration
-const adminConfig = {
-    // Super admins have full access
-    superAdmins: new Set(SUPER_ADMIN_IDS),
-    // Normal admins: each has access to specific groups
-    normalAdmins: new Map(), // adminId -> Set of groupIds
-};
-
-// Track which admins are assigned to which groups
-const groupAdmins = new Map(); // groupId -> adminId
+// Track which admin approved which group (for verification)
+const groupApprovedBy = new Map(); // groupId -> adminId
 
 // ✅ Auto-verify super admins
 SUPER_ADMIN_IDS.forEach(adminId => {
@@ -49,31 +47,8 @@ SUPER_ADMIN_IDS.forEach(adminId => {
     }
 });
 
-// ✅ Auto-verify normal admins
-ADMIN_IDS.forEach(adminId => {
-    if (adminId) {
-        verifiedUsers.add(adminId);
-        console.log(`✅ Admin ${adminId} auto-verified`);
-        // Initialize empty group list for normal admins
-        adminConfig.normalAdmins.set(adminId, new Set());
-    }
-});
-
-// ✅ Auto-approve allowed groups from .env (for super admin)
-ALLOWED_GROUP_IDS.forEach(groupId => {
-    if (groupId) {
-        approvedGroups.add(groupId);
-        // Assign to super admin by default
-        if (SUPER_ADMIN_IDS.length > 0) {
-            groupAdmins.set(groupId, SUPER_ADMIN_IDS[0]);
-        }
-        console.log(`✅ Group ${groupId} auto-approved from .env`);
-    }
-});
-
-console.log(`✅ Total Super Admins: ${SUPER_ADMIN_IDS.length}`);
-console.log(`✅ Total Normal Admins: ${ADMIN_IDS.length}`);
-console.log(`✅ Pre-approved groups: ${approvedGroups.size}`);
+console.log(`✅ Total Super Admins: ${superAdmins.size}`);
+console.log(`✅ Super Admins: ${Array.from(superAdmins).join(', ') || 'None'}`);
 
 // ==================== DNS Pre-resolution ====================
 console.log('🔍 Resolving Telegram API domain...');
@@ -281,10 +256,9 @@ app.get('/health', (req, res) => {
         verifiedUsers: verifiedUsers.size,
         approvedGroups: approvedGroups.size,
         pendingGroups: Object.keys(pendingGroups).length,
-        superAdmins: SUPER_ADMIN_IDS.length,
-        normalAdmins: ADMIN_IDS.length,
-        retryCount: retryCount,
-        version: '3.7',
+        normalAdmins: normalAdmins.size,
+        superAdmins: superAdmins.size,
+        version: '3.8',
         connection: {
             status: pollingActive ? 'connected' : 'disconnected',
             proxy: PROXY_URL ? 'configured' : 'none',
@@ -318,56 +292,59 @@ const ACTIVITIES = {
 // ==================== ADMIN HELPER FUNCTIONS ====================
 
 function isSuperAdmin(userId) {
-    return SUPER_ADMIN_IDS.includes(userId);
+    return superAdmins.has(userId);
 }
 
 function isNormalAdmin(userId) {
-    return ADMIN_IDS.includes(userId);
+    return normalAdmins.has(userId);
 }
 
 function isAdmin(userId) {
     return isSuperAdmin(userId) || isNormalAdmin(userId);
 }
 
-function getAdminGroups(userId) {
-    if (isSuperAdmin(userId)) {
-        // Super admins can access all groups
-        return approvedGroups;
-    } else if (isNormalAdmin(userId)) {
-        // Normal admins only access their assigned groups
-        return adminConfig.normalAdmins.get(userId) || new Set();
-    }
-    return new Set();
-}
-
-function canAdminAccessGroup(userId, groupId) {
-    if (isSuperAdmin(userId)) {
-        return true; // Super admin can access all groups
-    } else if (isNormalAdmin(userId)) {
-        const groups = adminConfig.normalAdmins.get(userId);
-        return groups && groups.has(groupId);
-    }
-    return false;
-}
-
-function assignAdminToGroup(adminId, groupId) {
-    if (!isAdmin(adminId)) {
-        return false;
-    }
-    if (!adminConfig.normalAdmins.has(adminId) && !isSuperAdmin(adminId)) {
-        return false;
-    }
+function canAdminApproveGroup(adminId, groupId) {
+    // Super admin can approve any group
     if (isSuperAdmin(adminId)) {
-        // Super admin doesn't need assignment
         return true;
     }
-    const groups = adminConfig.normalAdmins.get(adminId);
-    if (groups) {
-        groups.add(groupId);
-        groupAdmins.set(groupId, adminId);
+    
+    // Normal admin: check if they already have a group
+    if (normalAdmins.has(adminId)) {
+        const existingGroup = normalAdmins.get(adminId);
+        if (existingGroup) {
+            return false; // Already has a group, cannot approve more
+        }
+    }
+    
+    // Check if this group is already assigned to someone else
+    if (adminGroups.has(groupId)) {
+        const owner = adminGroups.get(groupId);
+        if (owner !== adminId) {
+            return false; // Group belongs to someone else
+        }
+    }
+    
+    return true;
+}
+
+function getAdminGroup(adminId) {
+    if (isSuperAdmin(adminId)) {
+        return null; // Super admin has no single group
+    }
+    return normalAdmins.get(adminId) || null;
+}
+
+function getGroupAdmin(groupId) {
+    return adminGroups.get(groupId) || null;
+}
+
+function isGroupOwner(adminId, groupId) {
+    if (isSuperAdmin(adminId)) {
         return true;
     }
-    return false;
+    const owner = adminGroups.get(groupId);
+    return owner === adminId;
 }
 
 // ==================== TIME HELPER FUNCTIONS ====================
@@ -478,8 +455,7 @@ async function isUserMemberOfChannel(userId) {
 }
 
 function isGroupAllowed(groupId) {
-    const groupIdStr = groupId.toString();
-    return approvedGroups.has(groupIdStr);
+    return approvedGroups.has(groupId);
 }
 
 function isGroup(chat) {
@@ -508,6 +484,7 @@ async function sendGroupVerificationRequest(chatId) {
         `This group needs to be approved by an admin before it can use the bot.\n\n` +
         `📋 *Group ID:* \`${chatId}\`\n\n` +
         `⏳ Please wait for admin approval. You will be notified once approved.\n\n` +
+        `*Admins:* A normal admin can approve ONE group only. Super admin can approve all.\n\n` +
         `*Need immediate access?* Contact an admin directly.`;
 
     try {
@@ -516,17 +493,16 @@ async function sendGroupVerificationRequest(chatId) {
         console.error(`[GROUP] Failed to send verification request to group ${chatId}:`, error.message);
     }
 
-    // Notify ALL admins about pending group
+    // Notify all admins about pending group
     const adminMessage = `🔔 *New Group Verification Request*\n\n` +
         `A new group is requesting access to the bot.\n\n` +
         `📋 *Group ID:* \`${chatId}\`\n` +
         `🕐 *Requested at:* ${new Date().toLocaleString()}\n\n` +
-        `*Super Admin Actions:*\n` +
+        `*Admin Actions:*\n` +
         `✅ Approve: /approvegroup ${chatId}\n` +
         `❌ Deny: /denygroup ${chatId}\n\n` +
-        `*Assign to Admin:*\n` +
-        `👤 /assignadmin [admin_id] ${chatId}\n\n` +
-        `💡 To pre-approve this group, add it to ALLOWED_GROUP_IDS in .env`;
+        `*Note:* Normal admins can approve ONE group only.\n` +
+        `Super admins can approve unlimited groups.`;
 
     await sendAdminNotification(adminMessage, 'Markdown');
     console.log(`[GROUP] Group ${chatId} pending approval`);
@@ -651,12 +627,12 @@ async function verifyUserAndGroup(msg) {
 
 // ==================== NOTIFICATION FUNCTIONS ====================
 
-async function sendNotification(message, parseMode = 'Markdown', onlyAdmins = true, targetGroupId = null) {
+async function sendAdminNotification(message, parseMode = 'Markdown', targetGroupId = null) {
     let sent = false;
     
     // If target group is specified, send to that group's admin
     if (targetGroupId) {
-        const adminId = groupAdmins.get(targetGroupId.toString());
+        const adminId = adminGroups.get(targetGroupId.toString());
         if (adminId) {
             try {
                 await bot.sendMessage(adminId, message, { parse_mode: parseMode });
@@ -667,34 +643,15 @@ async function sendNotification(message, parseMode = 'Markdown', onlyAdmins = tr
         }
     }
     
-    // Always send to all admins if no target group specified or for super admin notifications
-    if (!targetGroupId) {
-        // Send to super admins
-        for (const adminId of SUPER_ADMIN_IDS) {
-            if (adminId && adminId.trim()) {
-                try {
-                    await bot.sendMessage(adminId.trim(), message, { parse_mode: parseMode });
-                    sent = true;
-                } catch (err) {
-                    if (!err.message.includes('bot can\'t initiate conversation')) {
-                        console.error(`Failed to notify super admin ${adminId}:`, err.message);
-                    }
-                }
-            }
-        }
-    }
-    
-    // Send to normal admins only if not target specific
-    if (!targetGroupId) {
-        for (const adminId of ADMIN_IDS) {
-            if (adminId && adminId.trim()) {
-                try {
-                    await bot.sendMessage(adminId.trim(), message, { parse_mode: parseMode });
-                    sent = true;
-                } catch (err) {
-                    if (!err.message.includes('bot can\'t initiate conversation')) {
-                        console.error(`Failed to notify admin ${adminId}:`, err.message);
-                    }
+    // Always send to super admins
+    for (const adminId of SUPER_ADMIN_IDS) {
+        if (adminId && adminId.trim()) {
+            try {
+                await bot.sendMessage(adminId.trim(), message, { parse_mode: parseMode });
+                sent = true;
+            } catch (err) {
+                if (!err.message.includes('bot can\'t initiate conversation')) {
+                    console.error(`Failed to notify super admin ${adminId}:`, err.message);
                 }
             }
         }
@@ -705,8 +662,15 @@ async function sendNotification(message, parseMode = 'Markdown', onlyAdmins = tr
     }
 }
 
-function sendAdminNotification(message, parseMode = 'Markdown', targetGroupId = null) {
-    return sendNotification(message, parseMode, true, targetGroupId);
+function sendGroupAdminNotification(message, parseMode = 'Markdown', groupId) {
+    const adminId = adminGroups.get(groupId);
+    if (adminId) {
+        try {
+            bot.sendMessage(adminId, message, { parse_mode: parseMode });
+        } catch (err) {
+            console.log(`Failed to send to group admin:`, err.message);
+        }
+    }
 }
 
 function mentionUser(name, telegramId) {
@@ -771,9 +735,13 @@ function checkActivityTimeouts() {
                 const reminderMessage = `⚠️ ACTIVITY REMINDER\n\n${userMention} has been on ${activityDisplay} for over 15 minutes!\n\n⏱️ Duration: ${durationFormatted}\n\nPlease click 返回 (Back) to continue working.`;
                 bot.sendMessage(emp.currentChatId || telegramId, reminderMessage, { parse_mode: 'Markdown' }).catch(() => {});
                 
-                // Send to group admin if available
-                const groupId = emp.currentChatId && isGroup({ chat: { id: emp.currentChatId } }) ? emp.currentChatId : null;
-                sendAdminNotification(`⚠️ Activity Alert\n\n${userMention} has been on ${activityDisplay} for ${durationFormatted}`, 'Markdown', groupId);
+                // Send to group admin
+                const groupId = emp.currentChatId && isGroup({ chat: { id: emp.currentChatId } }) ? emp.currentChatId.toString() : null;
+                if (groupId) {
+                    sendGroupAdminNotification(`⚠️ Activity Alert\n\n${userMention} has been on ${activityDisplay} for ${durationFormatted}`, 'Markdown', groupId);
+                }
+                // Also send to super admins
+                sendAdminNotification(`⚠️ Activity Alert\n\n${userMention} has been on ${activityDisplay} for ${durationFormatted}`, 'Markdown');
                 emp.reminderSent = true;
             }
         }
@@ -792,10 +760,15 @@ function checkLateArrivals() {
             if (isUserLate(emp.workStart)) {
                 const lateDurationText = formatDurationWithSeconds(getLateDuration(emp.workStart));
                 const userMention = mentionUser(emp.name, telegramId);
+                const lateMessage = `⚠️ LATE ARRIVAL\n\n${userMention} started work late!\n⏱️ Late by: ${lateDurationText}`;
                 
-                // Send to group admin if available
-                const groupId = emp.currentChatId && isGroup({ chat: { id: emp.currentChatId } }) ? emp.currentChatId : null;
-                sendAdminNotification(`⚠️ LATE ARRIVAL\n\n${userMention} started work late!\n⏱️ Late by: ${lateDurationText}`, 'Markdown', groupId);
+                // Send to group admin
+                const groupId = emp.currentChatId && isGroup({ chat: { id: emp.currentChatId } }) ? emp.currentChatId.toString() : null;
+                if (groupId) {
+                    sendGroupAdminNotification(lateMessage, 'Markdown', groupId);
+                }
+                // Also send to super admins
+                sendAdminNotification(lateMessage, 'Markdown');
                 emp.lateNotified = true;
                 console.log(`[LATE] ${emp.name} - ${lateDurationText}`);
             }
@@ -828,7 +801,7 @@ const mainKeyboard = {
 // ==================== ADMIN COMMANDS ====================
 
 // Add a normal admin (Super Admin only)
-bot.onText(/\/addadmin (\d+)/, async (msg, match) => {
+bot.onText(/\/addadmin (.+)/, async (msg, match) => {
     const userId = msg.from.id.toString();
     const newAdminId = match[1].trim();
     
@@ -843,15 +816,14 @@ bot.onText(/\/addadmin (\d+)/, async (msg, match) => {
     }
     
     // Add to admin list
-    ADMIN_IDS.push(newAdminId);
+    normalAdmins.set(newAdminId, null); // No group assigned yet
     verifiedUsers.add(newAdminId);
-    adminConfig.normalAdmins.set(newAdminId, new Set());
     
-    await bot.sendMessage(msg.chat.id, `✅ User ${newAdminId} has been added as a normal admin.`);
+    await bot.sendMessage(msg.chat.id, `✅ User ${newAdminId} has been added as a normal admin.\n\nThey can now approve ONE group.`);
     
     // Notify the new admin
     try {
-        await bot.sendMessage(newAdminId, '✅ *You have been added as an admin!*\n\nYou can now approve groups and receive reports from groups assigned to you.\n\nUse /help to see available commands.', { parse_mode: 'Markdown' });
+        await bot.sendMessage(newAdminId, '✅ *You have been added as an admin!*\n\nYou can approve ONE group only.\n\nTo approve a group, add the bot to a group and send /start.\n\nUse /help to see available commands.', { parse_mode: 'Markdown' });
     } catch (err) {
         console.log(`Failed to notify new admin ${newAdminId}:`, err.message);
     }
@@ -859,8 +831,8 @@ bot.onText(/\/addadmin (\d+)/, async (msg, match) => {
     await sendAdminNotification(`👤 *New Admin Added*\n\nNew Admin ID: ${newAdminId}\nAdded by: ${msg.from.first_name}`);
 });
 
-// Remove an admin (Super Admin only)
-bot.onText(/\/removeadmin (\d+)/, async (msg, match) => {
+// Remove a normal admin (Super Admin only)
+bot.onText(/\/removeadmin (.+)/, async (msg, match) => {
     const userId = msg.from.id.toString();
     const targetAdminId = match[1].trim();
     
@@ -879,115 +851,85 @@ bot.onText(/\/removeadmin (\d+)/, async (msg, match) => {
         return;
     }
     
-    // Remove from admin list
-    const index = ADMIN_IDS.indexOf(targetAdminId);
-    if (index > -1) {
-        ADMIN_IDS.splice(index, 1);
-    }
-    adminConfig.normalAdmins.delete(targetAdminId);
-    
-    // Remove all group assignments for this admin
-    for (const [groupId, adminId] of groupAdmins) {
-        if (adminId === targetAdminId) {
-            groupAdmins.delete(groupId);
+    // Get the admin's group if any
+    const groupId = normalAdmins.get(targetAdminId);
+    if (groupId) {
+        // Remove the group from approved groups
+        approvedGroups.delete(groupId);
+        adminGroups.delete(groupId);
+        groupApprovedBy.delete(groupId);
+        
+        // Notify the group
+        try {
+            await bot.sendMessage(groupId, '❌ *Group Access Revoked*\n\nYour group has been revoked by the super admin.');
+        } catch (err) {
+            console.log(`Failed to notify group ${groupId}:`, err.message);
         }
     }
     
-    await bot.sendMessage(msg.chat.id, `✅ Admin ${targetAdminId} has been removed.`);
+    // Remove admin
+    normalAdmins.delete(targetAdminId);
     
+    await bot.sendMessage(msg.chat.id, `✅ Admin ${targetAdminId} has been removed.`);
     await sendAdminNotification(`👤 *Admin Removed*\n\nRemoved Admin ID: ${targetAdminId}\nRemoved by: ${msg.from.first_name}`);
 });
 
-// Assign admin to a group (Super Admin only)
-bot.onText(/\/assignadmin (\d+) (.+)/, async (msg, match) => {
-    const userId = msg.from.id.toString();
-    const adminId = match[1].trim();
-    const groupId = match[2].trim();
-    
-    if (!isSuperAdmin(userId)) {
-        await bot.sendMessage(msg.chat.id, '❌ Only Super Admins can assign admins to groups.');
-        return;
-    }
-    
-    if (!isNormalAdmin(adminId) && !isSuperAdmin(adminId)) {
-        await bot.sendMessage(msg.chat.id, `❌ User ${adminId} is not an admin.`);
-        return;
-    }
-    
-    if (!approvedGroups.has(groupId)) {
-        await bot.sendMessage(msg.chat.id, `❌ Group ${groupId} is not approved. Please approve it first with /approvegroup ${groupId}`);
-        return;
-    }
-    
-    if (isSuperAdmin(adminId)) {
-        await bot.sendMessage(msg.chat.id, 'ℹ️ Super Admins already have access to all groups.');
-        return;
-    }
-    
-    // Assign admin to group
-    const groups = adminConfig.normalAdmins.get(adminId);
-    if (groups) {
-        groups.add(groupId);
-        groupAdmins.set(groupId, adminId);
-        await bot.sendMessage(msg.chat.id, `✅ Admin ${adminId} assigned to group ${groupId}`);
-        
-        // Notify the admin
-        try {
-            await bot.sendMessage(adminId, `✅ You have been assigned to group ${groupId}\n\nYou will now receive reports from this group.`);
-        } catch (err) {
-            console.log(`Failed to notify admin ${adminId}:`, err.message);
-        }
-        
-        await sendAdminNotification(`👤 *Admin Assigned to Group*\n\nAdmin ID: ${adminId}\nGroup ID: ${groupId}\nAssigned by: ${msg.from.first_name}`);
-    }
-});
-
-// Remove admin from group (Super Admin only)
-bot.onText(/\/unassignadmin (\d+) (.+)/, async (msg, match) => {
-    const userId = msg.from.id.toString();
-    const adminId = match[1].trim();
-    const groupId = match[2].trim();
-    
-    if (!isSuperAdmin(userId)) {
-        await bot.sendMessage(msg.chat.id, '❌ Only Super Admins can unassign admins from groups.');
-        return;
-    }
-    
-    if (!isNormalAdmin(adminId)) {
-        await bot.sendMessage(msg.chat.id, `❌ User ${adminId} is not a normal admin.`);
-        return;
-    }
-    
-    const groups = adminConfig.normalAdmins.get(adminId);
-    if (groups && groups.has(groupId)) {
-        groups.delete(groupId);
-        groupAdmins.delete(groupId);
-        await bot.sendMessage(msg.chat.id, `✅ Admin ${adminId} unassigned from group ${groupId}`);
-        
-        await sendAdminNotification(`👤 *Admin Unassigned from Group*\n\nAdmin ID: ${adminId}\nGroup ID: ${groupId}\nUnassigned by: ${msg.from.first_name}`);
-    } else {
-        await bot.sendMessage(msg.chat.id, `❌ Admin ${adminId} is not assigned to group ${groupId}`);
-    }
-});
-
-// Approve a group (Super Admin only)
+// Approve a group
 bot.onText(/\/approvegroup (.+)/, async (msg, match) => {
     const userId = msg.from.id.toString();
     const groupId = match[1].trim();
     
-    if (!isSuperAdmin(userId)) {
-        await bot.sendMessage(msg.chat.id, '❌ Only Super Admins can approve groups.');
+    if (!isAdmin(userId)) {
+        await bot.sendMessage(msg.chat.id, '❌ Admin only command.');
         return;
     }
     
+    // Check if group already approved
+    if (approvedGroups.has(groupId)) {
+        await bot.sendMessage(msg.chat.id, `ℹ️ Group ${groupId} is already approved.`);
+        return;
+    }
+    
+    // Check if group is pending
+    if (!pendingGroups[groupId]) {
+        await bot.sendMessage(msg.chat.id, `❌ Group ${groupId} is not pending approval.`);
+        return;
+    }
+    
+    // Check if admin can approve
+    if (!canAdminApproveGroup(userId, groupId)) {
+        if (isNormalAdmin(userId)) {
+            const existingGroup = normalAdmins.get(userId);
+            if (existingGroup) {
+                await bot.sendMessage(msg.chat.id, `❌ You already have a group approved (ID: ${existingGroup}).\n\nYou can only approve ONE group.\n\nUse /revokegroup to revoke your current group first.`);
+            } else {
+                await bot.sendMessage(msg.chat.id, `❌ You cannot approve this group.`);
+            }
+        }
+        return;
+    }
+    
+    // Approve the group
     approvedGroups.add(groupId);
     delete pendingGroups[groupId];
     
-    await bot.sendMessage(msg.chat.id, `✅ Group ${groupId} has been approved!`);
+    // Store the admin who approved this group
+    if (isNormalAdmin(userId)) {
+        normalAdmins.set(userId, groupId);
+        adminGroups.set(groupId, userId);
+        groupApprovedBy.set(groupId, userId);
+    } else {
+        // Super admin approving
+        groupApprovedBy.set(groupId, 'super_admin');
+        adminGroups.set(groupId, 'super_admin');
+    }
+    
+    const adminType = isSuperAdmin(userId) ? 'Super Admin' : 'Admin';
+    await bot.sendMessage(msg.chat.id, `✅ Group ${groupId} has been approved by ${adminType}!`);
     
     // Notify the group
     try {
-        await bot.sendMessage(groupId, '✅ *Group Approved!*\n\nThis group has been approved by a Super Admin and can now use the bot.\n\nUse the buttons below to start tracking attendance.', { 
+        await bot.sendMessage(groupId, '✅ *Group Approved!*\n\nThis group has been approved and can now use the bot.\n\nUse the buttons below to start tracking attendance.', { 
             parse_mode: 'Markdown',
             ...mainKeyboard 
         });
@@ -995,7 +937,7 @@ bot.onText(/\/approvegroup (.+)/, async (msg, match) => {
         console.log(`Failed to notify group ${groupId}:`, err.message);
     }
     
-    await sendAdminNotification(`✅ *Group Approved*\n\nGroup ID: ${groupId}\nApproved by: ${msg.from.first_name}`);
+    await sendAdminNotification(`✅ *Group Approved*\n\nGroup ID: ${groupId}\nApproved by: ${msg.from.first_name}\nAdmin Type: ${adminType}`);
 });
 
 // Deny a group (Super Admin only)
@@ -1021,7 +963,79 @@ bot.onText(/\/denygroup (.+)/, async (msg, match) => {
     await sendAdminNotification(`❌ *Group Denied*\n\nGroup ID: ${groupId}\nDenied by: ${msg.from.first_name}`);
 });
 
-// List pending groups (All admins)
+// Revoke group access (Normal Admin only - revoke their own group)
+bot.onText(/\/revokegroup/, async (msg) => {
+    const userId = msg.from.id.toString();
+    
+    if (!isNormalAdmin(userId)) {
+        await bot.sendMessage(msg.chat.id, '❌ Only normal admins can revoke their own group.');
+        return;
+    }
+    
+    const groupId = normalAdmins.get(userId);
+    if (!groupId) {
+        await bot.sendMessage(msg.chat.id, '❌ You don\'t have any group approved.');
+        return;
+    }
+    
+    // Revoke the group
+    approvedGroups.delete(groupId);
+    adminGroups.delete(groupId);
+    groupApprovedBy.delete(groupId);
+    normalAdmins.set(userId, null);
+    
+    await bot.sendMessage(msg.chat.id, `✅ Your group ${groupId} has been revoked.\n\nYou can now approve a new group if needed.`);
+    
+    // Notify the group
+    try {
+        await bot.sendMessage(groupId, '❌ *Group Access Revoked*\n\nYour group access has been revoked by the admin.\n\nPlease contact your admin for more information.');
+    } catch (err) {
+        console.log(`Failed to notify group ${groupId}:`, err.message);
+    }
+    
+    await sendAdminNotification(`🔄 *Group Revoked*\n\nGroup ID: ${groupId}\nRevoked by: ${msg.from.first_name}`);
+});
+
+// Super Admin revoke any group
+bot.onText(/\/revokegroup (.+)/, async (msg, match) => {
+    const userId = msg.from.id.toString();
+    const groupId = match[1].trim();
+    
+    if (!isSuperAdmin(userId)) {
+        await bot.sendMessage(msg.chat.id, '❌ Only Super Admins can revoke groups.');
+        return;
+    }
+    
+    if (!approvedGroups.has(groupId)) {
+        await bot.sendMessage(msg.chat.id, `❌ Group ${groupId} is not approved.`);
+        return;
+    }
+    
+    // Find which admin owns this group
+    let ownerAdminId = adminGroups.get(groupId);
+    if (ownerAdminId && ownerAdminId !== 'super_admin') {
+        // Remove from normal admin's list
+        normalAdmins.set(ownerAdminId, null);
+    }
+    
+    // Remove group
+    approvedGroups.delete(groupId);
+    adminGroups.delete(groupId);
+    groupApprovedBy.delete(groupId);
+    
+    await bot.sendMessage(msg.chat.id, `✅ Group ${groupId} has been revoked.`);
+    
+    // Notify the group
+    try {
+        await bot.sendMessage(groupId, '❌ *Group Access Revoked*\n\nYour group access has been revoked by the Super Admin.');
+    } catch (err) {
+        console.log(`Failed to notify group ${groupId}:`, err.message);
+    }
+    
+    await sendAdminNotification(`🔄 *Group Revoked by Super Admin*\n\nGroup ID: ${groupId}\nRevoked by: ${msg.from.first_name}`);
+});
+
+// List pending groups
 bot.onText(/\/pendinggroups/, async (msg) => {
     const userId = msg.from.id.toString();
     
@@ -1041,78 +1055,28 @@ bot.onText(/\/pendinggroups/, async (msg) => {
     pendingList.forEach((groupId, index) => {
         const request = pendingGroups[groupId];
         const time = new Date(request.timestamp).toLocaleString();
-        message += `${index + 1}. Group ID: \`${groupId}\`\n   Requested: ${time}\n`;
+        message += `${index + 1}. Group ID: \`${groupId}\`\n`;
+        message += `   Requested: ${time}\n`;
+        message += `   Approve: /approvegroup ${groupId}\n`;
         if (isSuperAdmin(userId)) {
-            message += `   Approve: /approvegroup ${groupId}\n`;
             message += `   Deny: /denygroup ${groupId}\n`;
-            message += `   Assign: /assignadmin [admin_id] ${groupId}\n`;
         }
         message += '\n';
     });
     
-    await bot.sendMessage(msg.chat.id, message, { parse_mode: 'Markdown' });
-});
-
-// List my assigned groups (Normal admins)
-bot.onText(/\/mygroups/, async (msg) => {
-    const userId = msg.from.id.toString();
-    
-    if (!isAdmin(userId)) {
-        await bot.sendMessage(msg.chat.id, '❌ Admin only command.');
-        return;
-    }
-    
-    const groups = getAdminGroups(userId);
-    
-    if (groups.size === 0) {
-        if (isSuperAdmin(userId)) {
-            await bot.sendMessage(msg.chat.id, '👑 *Super Admin*\n\nYou have access to all groups.\n\nUse /approvedgroups to see all approved groups.', { parse_mode: 'Markdown' });
-        } else {
-            await bot.sendMessage(msg.chat.id, '📋 You are not assigned to any groups yet. Contact a Super Admin to get assigned.');
-        }
-        return;
-    }
-    
-    let message = isSuperAdmin(userId) ? '👑 *Super Admin - All Groups*\n\n' : '*Your Assigned Groups:*\n\n';
-    const groupList = Array.from(groups);
-    groupList.forEach((groupId, index) => {
-        const adminId = groupAdmins.get(groupId);
-        const adminName = adminId === userId ? 'You' : adminId;
-        message += `${index + 1}. \`${groupId}\`\n`;
-        message += `   Admin: ${adminName}\n`;
-    });
-    
-    await bot.sendMessage(msg.chat.id, message, { parse_mode: 'Markdown' });
-});
-
-// List all admins (Super Admin only)
-bot.onText(/\/listadmins/, async (msg) => {
-    const userId = msg.from.id.toString();
-    
-    if (!isSuperAdmin(userId)) {
-        await bot.sendMessage(msg.chat.id, '❌ Only Super Admins can view all admins.');
-        return;
-    }
-    
-    let message = '*👑 Super Admins:*\n\n';
-    SUPER_ADMIN_IDS.forEach(id => {
-        message += `- \`${id}\` (Full Access)\n`;
-    });
-    
-    message += '\n*👤 Normal Admins:*\n\n';
-    if (ADMIN_IDS.length === 0) {
-        message += 'No normal admins configured.\n';
+    if (isSuperAdmin(userId)) {
+        message += '\n*Super Admin:* You can approve or deny any group.';
     } else {
-        ADMIN_IDS.forEach(id => {
-            const groups = adminConfig.normalAdmins.get(id) || new Set();
-            message += `- \`${id}\` (${groups.size} groups)\n`;
-        });
+        message += '\n*Note:* You can approve ONE group only.';
+        if (normalAdmins.get(userId)) {
+            message += `\nYou already have a group approved: ${normalAdmins.get(userId)}`;
+        }
     }
     
     await bot.sendMessage(msg.chat.id, message, { parse_mode: 'Markdown' });
 });
 
-// List approved groups (All admins)
+// List approved groups
 bot.onText(/\/approvedgroups/, async (msg) => {
     const userId = msg.from.id.toString();
     
@@ -1130,11 +1094,69 @@ bot.onText(/\/approvedgroups/, async (msg) => {
     
     let message = '*Approved Groups:*\n\n';
     approvedList.forEach((groupId, index) => {
-        const adminId = groupAdmins.get(groupId);
-        const adminStatus = adminId ? `Assigned to: ${adminId}` : 'Not assigned';
-        message += `${index + 1}. \`${groupId}\`\n`;
-        message += `   ${adminStatus}\n`;
+        const adminId = groupApprovedBy.get(groupId);
+        const adminName = adminId === 'super_admin' ? 'Super Admin' : adminId || 'Unknown';
+        message += `${index + 1}. Group ID: \`${groupId}\`\n`;
+        message += `   Approved by: ${adminName}\n`;
     });
+    
+    await bot.sendMessage(msg.chat.id, message, { parse_mode: 'Markdown' });
+});
+
+// My group (for normal admins)
+bot.onText(/\/mygroup/, async (msg) => {
+    const userId = msg.from.id.toString();
+    
+    if (!isNormalAdmin(userId)) {
+        await bot.sendMessage(msg.chat.id, '❌ Only normal admins can view their group.');
+        return;
+    }
+    
+    const groupId = normalAdmins.get(userId);
+    if (!groupId) {
+        await bot.sendMessage(msg.chat.id, '📋 You don\'t have any group approved yet.\n\nTo approve a group, add the bot to a group and send /start.');
+        return;
+    }
+    
+    const isApproved = approvedGroups.has(groupId);
+    const status = isApproved ? '✅ Active' : '⏳ Pending';
+    
+    let message = `*Your Group:*\n\n`;
+    message += `📋 Group ID: \`${groupId}\`\n`;
+    message += `📊 Status: ${status}\n`;
+    message += `📅 Approved: ${groupApprovedBy.get(groupId) ? 'Yes' : 'No'}\n\n`;
+    message += `*Actions:*\n`;
+    message += `🔄 /revokegroup - Revoke this group\n`;
+    message += `📊 /status - View employee status\n`;
+    message += `📋 /report - View daily report`;
+    
+    await bot.sendMessage(msg.chat.id, message, { parse_mode: 'Markdown' });
+});
+
+// List all admins (Super Admin only)
+bot.onText(/\/listadmins/, async (msg) => {
+    const userId = msg.from.id.toString();
+    
+    if (!isSuperAdmin(userId)) {
+        await bot.sendMessage(msg.chat.id, '❌ Only Super Admins can view all admins.');
+        return;
+    }
+    
+    let message = '*👑 Super Admins:*\n\n';
+    Array.from(superAdmins).forEach(id => {
+        message += `- \`${id}\` (Full Access)\n`;
+    });
+    
+    message += '\n*👤 Normal Admins:*\n\n';
+    if (normalAdmins.size === 0) {
+        message += 'No normal admins configured.\n';
+        message += '\nTo add: /addadmin [user_id]';
+    } else {
+        for (const [adminId, groupId] of normalAdmins) {
+            const groupStatus = groupId ? `Group: ${groupId}` : 'No group yet';
+            message += `- \`${adminId}\` (${groupStatus})\n`;
+        }
+    }
     
     await bot.sendMessage(msg.chat.id, message, { parse_mode: 'Markdown' });
 });
@@ -1269,7 +1291,7 @@ bot.on('callback_query', async (callbackQuery) => {
                 `4️⃣ Click the "✅ I have joined!" button again\n\n` +
                 `*Still having issues?*\n` +
                 `Contact an admin for manual verification.\n\n` +
-                `Admins: ${SUPER_ADMIN_IDS.join(', ')}`;
+                `Admins: ${Array.from(superAdmins).join(', ')}`;
             
             await bot.sendMessage(chatId, failMessage, { parse_mode: 'Markdown' });
             
@@ -1290,52 +1312,103 @@ bot.on('callback_query', async (callbackQuery) => {
 bot.onText(/\/help/, async (msg) => {
     const chatId = msg.chat.id;
     const userId = msg.from ? msg.from.id.toString() : null;
-    const isAdminUser = isAdmin(userId);
     const isSuperAdminUser = isSuperAdmin(userId);
+    const isNormalAdminUser = isNormalAdmin(userId);
     
-    let helpMessage = `*Bot Usage Guide*
-
-Work Hours: 8:00 AM Mexico Time
-Late Threshold: 15 minutes
-Activity Limit: 15 minutes
-
-*User Commands:*
-/start - Welcome message
-/status - View employee status
-/report - View daily report
-/mytime - Check Mexico time
-/help - Show this message
-
-*Buttons:*
-上班 - Start work
-下班 - Finish work
-吃饭, 抽烟, 厕所, 下楼拿外卖 - Take breaks
-返回 - Return from break
-
-*Verification:*
-- Groups: Must be approved by admin
-- Personal: Must join referral channel
-- Admins: Auto-verified`;
-
-    if (isAdminUser) {
-        helpMessage += `\n\n*Admin Commands:*\n`;
-        helpMessage += `📋 /pendinggroups - List groups waiting for approval\n`;
-        helpMessage += `📊 /approvedgroups - List all approved groups\n`;
-        helpMessage += `📋 /mygroups - List your assigned groups\n`;
-        helpMessage += `👤 /verify [user_id] - Manually verify a user\n`;
-        helpMessage += `👤 /unverify [user_id] - Unverify a user\n`;
-        helpMessage += `📋 /listverified - List all verified users\n`;
+    let helpMessage = `*🤖 Attendance Bot Help*\n\n`;
+    helpMessage += `Work Hours: 8:00 AM Mexico Time\n`;
+    helpMessage += `Late Threshold: 15 minutes\n`;
+    helpMessage += `Activity Limit: 15 minutes\n\n`;
+    
+    if (isSuperAdminUser) {
+        helpMessage += `*👑 SUPER ADMIN COMMANDS*\n\n`;
+        helpMessage += `📋 *Admin Management:*\n`;
+        helpMessage += `👤 /addadmin [user_id] - Add a normal admin\n`;
+        helpMessage += `👤 /removeadmin [user_id] - Remove a normal admin\n`;
+        helpMessage += `📋 /listadmins - List all admins\n\n`;
         
-        if (isSuperAdminUser) {
-            helpMessage += `\n*👑 Super Admin Commands:*\n`;
-            helpMessage += `👤 /addadmin [user_id] - Add a normal admin\n`;
-            helpMessage += `👤 /removeadmin [user_id] - Remove a normal admin\n`;
-            helpMessage += `👤 /listadmins - List all admins\n`;
-            helpMessage += `✅ /approvegroup [group_id] - Approve a group\n`;
-            helpMessage += `❌ /denygroup [group_id] - Deny a group\n`;
-            helpMessage += `👤 /assignadmin [admin_id] [group_id] - Assign admin to group\n`;
-            helpMessage += `👤 /unassignadmin [admin_id] [group_id] - Unassign admin from group\n`;
+        helpMessage += `📋 *Group Management:*\n`;
+        helpMessage += `📋 /pendinggroups - List pending groups\n`;
+        helpMessage += `📊 /approvedgroups - List approved groups\n`;
+        helpMessage += `✅ /approvegroup [group_id] - Approve a group\n`;
+        helpMessage += `❌ /denygroup [group_id] - Deny a group\n`;
+        helpMessage += `🔄 /revokegroup [group_id] - Revoke a group\n\n`;
+        
+        helpMessage += `👤 *User Management:*\n`;
+        helpMessage += `✅ /verify [user_id] - Verify a user\n`;
+        helpMessage += `❌ /unverify [user_id] - Unverify a user\n`;
+        helpMessage += `📋 /listverified - List verified users\n\n`;
+        
+        helpMessage += `📊 *Reports:*\n`;
+        helpMessage += `📊 /status - View employee status\n`;
+        helpMessage += `📋 /report - View daily report\n`;
+        helpMessage += `🕐 /mytime - Check Mexico time\n\n`;
+        
+        helpMessage += `*Note:* As Super Admin, you have access to ALL groups and ALL reports.`;
+        
+    } else if (isNormalAdminUser) {
+        const groupId = normalAdmins.get(userId);
+        
+        helpMessage += `*👤 NORMAL ADMIN COMMANDS*\n\n`;
+        helpMessage += `📋 *Your Info:*\n`;
+        helpMessage += `📋 /mygroup - View your group\n`;
+        helpMessage += `🔄 /revokegroup - Revoke your group\n\n`;
+        
+        helpMessage += `📋 *Group Management:*\n`;
+        helpMessage += `📋 /pendinggroups - List pending groups\n`;
+        helpMessage += `📊 /approvedgroups - List approved groups\n`;
+        helpMessage += `✅ /approvegroup [group_id] - Approve a group (ONE only)\n\n`;
+        
+        if (groupId) {
+            helpMessage += `📊 *Your Group (${groupId}):*\n`;
+            helpMessage += `📊 /status - View employee status\n`;
+            helpMessage += `📋 /report - View daily report\n`;
+            helpMessage += `🕐 /mytime - Check Mexico time\n\n`;
         }
+        
+        helpMessage += `👤 *User Management:*\n`;
+        helpMessage += `✅ /verify [user_id] - Verify a user\n`;
+        helpMessage += `❌ /unverify [user_id] - Unverify a user\n`;
+        helpMessage += `📋 /listverified - List verified users\n\n`;
+        
+        helpMessage += `*Note:* You can approve ONE group only. Once approved, you cannot approve more.\n`;
+        if (groupId) {
+            helpMessage += `✅ Your group is: \`${groupId}\`\n`;
+        } else {
+            helpMessage += `⏳ You haven't approved any group yet.\n`;
+            helpMessage += `To approve: Add bot to group, send /start, then use /approvegroup [group_id]`;
+        }
+        
+        helpMessage += `\n\n*Need help?* Contact a Super Admin.`;
+        
+    } else {
+        // Regular user
+        helpMessage += `*👤 USER COMMANDS*\n\n`;
+        helpMessage += `📋 /start - Start the bot\n`;
+        helpMessage += `📊 /status - View employee status\n`;
+        helpMessage += `📋 /report - View daily report\n`;
+        helpMessage += `🕐 /mytime - Check Mexico time\n`;
+        helpMessage += `❓ /help - Show this message\n\n`;
+        
+        helpMessage += `*Buttons:*\n`;
+        helpMessage += `🟢 上班 - Start work\n`;
+        helpMessage += `🔴 下班 - Finish work\n`;
+        helpMessage += `🍚 吃饭 - Meal break\n`;
+        helpMessage += `🚬 抽烟 - Smoke break\n`;
+        helpMessage += `🚽 厕所 - Restroom break\n`;
+        helpMessage += `📦 下楼拿外卖 - Delivery break\n`;
+        helpMessage += `↩️ 返回 - Return from break\n\n`;
+        
+        helpMessage += `*How to use:*\n`;
+        helpMessage += `1. Click 上班 to start work\n`;
+        helpMessage += `2. Use break buttons when taking breaks\n`;
+        helpMessage += `3. Click 返回 when returning from break\n`;
+        helpMessage += `4. Click 下班 when finishing work\n\n`;
+        
+        helpMessage += `*Verification:*\n`;
+        helpMessage += `- Personal chat: Must join referral channel\n`;
+        helpMessage += `- Groups: Must be approved by admin\n`;
+        helpMessage += `- Admins: Auto-verified`;
     }
     
     try {
@@ -1373,7 +1446,6 @@ bot.onText(/\/start/, async (msg) => {
         const welcomeMessage = `Welcome ${name}!\n\nWork Hours: 8:00 AM Mexico Time\nActivity Limit: 15 minutes\n\nUse the buttons below to track your work.`;
         await bot.sendMessage(chatId, welcomeMessage, mainKeyboard);
         
-        // Send user activation notification to admins
         const adminMessage = `👤 *User Active*\n\n${mentionUser(name, telegramId)} started using the bot.`;
         await sendAdminNotification(adminMessage, 'Markdown');
     } catch (error) {
@@ -1399,7 +1471,9 @@ bot.onText(/\/mytime/, async (msg) => {
 bot.onText(/\/status/, async (msg) => {
     const chatId = msg.chat.id;
     const isGroupChat = isGroup(msg.chat);
+    const userId = msg.from ? msg.from.id.toString() : null;
     
+    // If it's a group, check if approved
     if (isGroupChat && !isGroupAllowed(chatId)) {
         try {
             await bot.sendMessage(chatId, '❌ This group is not authorized to use this bot.');
@@ -1407,11 +1481,70 @@ bot.onText(/\/status/, async (msg) => {
         return;
     }
     
+    // For personal chats, verify user
     if (!isGroupChat) {
         const verified = await verifyUserAndGroup(msg);
         if (!verified) return;
     }
     
+    // If it's a normal admin, only show their group
+    if (isNormalAdmin(userId) && !isSuperAdmin(userId)) {
+        const adminGroupId = normalAdmins.get(userId);
+        // Filter employees by group
+        const groupEmployees = {};
+        for (const [telegramId, emp] of Object.entries(employees)) {
+            if (emp.currentChatId && emp.currentChatId.toString() === adminGroupId) {
+                groupEmployees[telegramId] = emp;
+            }
+        }
+        
+        if (Object.keys(groupEmployees).length === 0) {
+            await bot.sendMessage(chatId, '📊 No employees in your group yet.');
+            return;
+        }
+        
+        const working = [];
+        const away = [];
+        const late = [];
+        
+        for (const [telegramId, emp] of Object.entries(groupEmployees)) {
+            if (telegramId.startsWith('channel_')) continue;
+            if (emp.status === 'working') {
+                let workingText = `${emp.name}`;
+                if (isUserLate(emp.workStart)) {
+                    workingText += ` (Late by ${getLateDurationFormatted(emp.workStart)})`;
+                    late.push(emp.name);
+                }
+                working.push(workingText);
+            } else if (emp.status === 'away') {
+                let activityDisplay = '';
+                for (const [key, config] of Object.entries(ACTIVITIES)) {
+                    if (config.type === emp.currentActivity) {
+                        activityDisplay = config.name;
+                        break;
+                    }
+                }
+                const duration = emp.activityStart ? Date.now() - emp.activityStart : 0;
+                away.push(`${emp.name} - ${activityDisplay} (${formatDurationWithSeconds(duration)})`);
+            }
+        }
+        
+        let statusMessage = `*Your Group Status*\n\n`;
+        statusMessage += '🟢 WORKING\n';
+        statusMessage += working.length > 0 ? working.join('\n') : 'None\n';
+        if (late.length > 0) statusMessage += `\n⚠️ Late Arrivals: ${late.length}\n`;
+        statusMessage += '\n🟡 AWAY\n';
+        statusMessage += away.length > 0 ? away.join('\n') : 'None';
+        
+        try {
+            await bot.sendMessage(chatId, statusMessage, { parse_mode: 'Markdown' });
+        } catch (error) {
+            console.error('Error in /status:', error.message);
+        }
+        return;
+    }
+    
+    // Super admin or regular user - show all employees
     const working = [];
     const away = [];
     const late = [];
@@ -1455,7 +1588,9 @@ bot.onText(/\/status/, async (msg) => {
 bot.onText(/\/report/, async (msg) => {
     const chatId = msg.chat.id;
     const isGroupChat = isGroup(msg.chat);
+    const userId = msg.from ? msg.from.id.toString() : null;
     
+    // If it's a group, check if approved
     if (isGroupChat && !isGroupAllowed(chatId)) {
         try {
             await bot.sendMessage(chatId, '❌ This group is not authorized to use this bot.');
@@ -1463,11 +1598,62 @@ bot.onText(/\/report/, async (msg) => {
         return;
     }
     
+    // For personal chats, verify user
     if (!isGroupChat) {
         const verified = await verifyUserAndGroup(msg);
         if (!verified) return;
     }
     
+    // If it's a normal admin, only show their group
+    if (isNormalAdmin(userId) && !isSuperAdmin(userId)) {
+        const adminGroupId = normalAdmins.get(userId);
+        // Filter employees by group
+        const groupEmployees = {};
+        for (const [telegramId, emp] of Object.entries(employees)) {
+            if (emp.currentChatId && emp.currentChatId.toString() === adminGroupId) {
+                groupEmployees[telegramId] = emp;
+            }
+        }
+        
+        if (Object.keys(groupEmployees).length === 0) {
+            await bot.sendMessage(chatId, '📊 No employees in your group yet.');
+            return;
+        }
+        
+        let reportMessage = '*Your Group Daily Report*\n\n';
+        for (const [telegramId, emp] of Object.entries(groupEmployees)) {
+            if (telegramId.startsWith('channel_')) continue;
+            const workStart = emp.dailyReport.workStart || emp.workStart;
+            const workEnd = emp.dailyReport.workEnd || emp.workEnd;
+            const totals = emp.dailyReport.totals || emp.totals;
+            
+            let totalWorkMs = 0;
+            if (workStart && workEnd) {
+                totalWorkMs = workEnd - workStart;
+                totalWorkMs -= (totals.meal + totals.smoke + totals.restroom + totals.delivery);
+            }
+            
+            reportMessage += `*${emp.name}*\n`;
+            reportMessage += `Start: ${formatMexicoTime(workStart)}\n`;
+            reportMessage += `Finish: ${formatMexicoTime(workEnd)}\n`;
+            if (isUserLate(workStart)) reportMessage += `⚠️ Late by: ${getLateDurationFormatted(workStart)}\n`;
+            reportMessage += `\n*Breakdown:*\n`;
+            reportMessage += `🍚 Meal: ${formatDurationWithSeconds(totals.meal)}\n`;
+            reportMessage += `🚬 Smoke: ${formatDurationWithSeconds(totals.smoke)}\n`;
+            reportMessage += `🚽 Restroom: ${formatDurationWithSeconds(totals.restroom)}\n`;
+            reportMessage += `📦 Delivery: ${formatDurationWithSeconds(totals.delivery)}\n`;
+            reportMessage += `\n✅ Total Work: ${formatDurationWithSeconds(totalWorkMs)}\n\n`;
+        }
+        
+        try {
+            await bot.sendMessage(chatId, reportMessage, { parse_mode: 'Markdown' });
+        } catch (error) {
+            console.error('Error in /report:', error.message);
+        }
+        return;
+    }
+    
+    // Super admin or regular user - show all employees
     if (Object.keys(employees).length === 0) {
         try {
             await bot.sendMessage(chatId, 'No employee data available yet.');
@@ -1572,7 +1758,14 @@ bot.onText(/上班/, async (msg) => {
             if (late) {
                 const lateDurationText = formatDurationWithSeconds(getLateDuration(now));
                 response += `\n\n⚠️ You are late!\n⏱️ Late by: ${lateDurationText}`;
-                await sendAdminNotification(`⚠️ LATE ARRIVAL\n\n${mentionUser(name, telegramId)} started work at ${actualTimeFormatted}\nLate by: ${lateDurationText}`, 'Markdown', chatId);
+                const lateMessage = `⚠️ LATE ARRIVAL\n\n${mentionUser(name, telegramId)} started work at ${actualTimeFormatted}\nLate by: ${lateDurationText}`;
+                
+                // Send to group admin
+                const groupId = chatId && isGroup({ chat: { id: chatId } }) ? chatId.toString() : null;
+                if (groupId) {
+                    sendGroupAdminNotification(lateMessage, 'Markdown', groupId);
+                }
+                sendAdminNotification(lateMessage, 'Markdown');
             } else {
                 console.log(`[ON TIME] ${name} started at ${actualTimeFormatted}`);
             }
@@ -1629,7 +1822,14 @@ bot.onText(/下班/, async (msg) => {
             const response = `✅ ${name} finished work\n\n📊 Work Summary:\n⏱️ Work Duration: ${formatDurationWithSeconds(workDurationMs)}\n⏱️ Break Time: ${formatDurationWithSeconds(totalBreaks)}`;
             await bot.sendMessage(chatId, response, { parse_mode: 'Markdown', ...mainKeyboard });
             
-            await sendAdminNotification(`📊 *Work Summary*\n\n${mentionUser(name, telegramId)}\n⏱️ Work Duration: ${formatDurationWithSeconds(workDurationMs)}\n⏱️ Break Time: ${formatDurationWithSeconds(totalBreaks)}`, 'Markdown', chatId);
+            const summaryMessage = `📊 *Work Summary*\n\n${mentionUser(name, telegramId)}\n⏱️ Work Duration: ${formatDurationWithSeconds(workDurationMs)}\n⏱️ Break Time: ${formatDurationWithSeconds(totalBreaks)}`;
+            
+            // Send to group admin
+            const groupId = chatId && isGroup({ chat: { id: chatId } }) ? chatId.toString() : null;
+            if (groupId) {
+                sendGroupAdminNotification(summaryMessage, 'Markdown', groupId);
+            }
+            sendAdminNotification(summaryMessage, 'Markdown');
         } catch (error) {
             console.error('Error in 下班:', error);
             try {
@@ -1713,7 +1913,14 @@ bot.onText(/返回/, async (msg) => {
             const response = `✅ ${name} returned\n\n📊 Activity: ${activityDisplay}\n⏱️ Duration: ${formatDurationWithSeconds(durationMs)}`;
             await bot.sendMessage(chatId, response, { parse_mode: 'Markdown', ...mainKeyboard });
             
-            await sendAdminNotification(`⏱️ *Break Summary*\n\n${mentionUser(name, telegramId)}\n📊 ${activityDisplay}: ${formatDurationWithSeconds(durationMs)}`, 'Markdown', chatId);
+            const breakMessage = `⏱️ *Break Summary*\n\n${mentionUser(name, telegramId)}\n📊 ${activityDisplay}: ${formatDurationWithSeconds(durationMs)}`;
+            
+            // Send to group admin
+            const groupId = chatId && isGroup({ chat: { id: chatId } }) ? chatId.toString() : null;
+            if (groupId) {
+                sendGroupAdminNotification(breakMessage, 'Markdown', groupId);
+            }
+            sendAdminNotification(breakMessage, 'Markdown');
         } catch (error) {
             console.error('Error in 返回:', error);
             try {
@@ -1769,15 +1976,15 @@ process.on('SIGINT', () => {
 });
 
 // ==================== STARTUP ====================
-console.log('🚀 Starting Employee Attendance Bot v3.7');
+console.log('🚀 Starting Employee Attendance Bot v3.8');
 console.log('================================================');
 console.log(`✅ Timezone: ${MEXICO_TIMEZONE}`);
 console.log(`✅ Work start: ${WORK_START_HOUR}:${WORK_START_MINUTE} AM`);
 console.log(`✅ Late threshold: ${LATE_THRESHOLD_MINUTES} minutes`);
-console.log(`✅ Super Admins: ${SUPER_ADMIN_IDS.length > 0 ? SUPER_ADMIN_IDS.join(', ') : 'None'}`);
-console.log(`✅ Normal Admins: ${ADMIN_IDS.length > 0 ? ADMIN_IDS.join(', ') : 'None'}`);
-console.log(`✅ Group Chat: ${GROUP_CHAT_ID || 'Not set'}`);
-console.log(`✅ Pre-approved Groups: ${approvedGroups.size > 0 ? Array.from(approvedGroups).join(', ') : 'None'}`);
+console.log(`✅ Super Admins: ${Array.from(superAdmins).join(', ') || 'None'}`);
+console.log(`✅ Normal Admins: ${normalAdmins.size}`);
+console.log(`✅ Approved Groups: ${approvedGroups.size}`);
+console.log(`✅ Pending Groups: ${Object.keys(pendingGroups).length}`);
 console.log(`✅ Referral Channel: ${REFERRAL_CHANNEL_ID || 'Not set'}`);
 console.log(`✅ API URL: ${TELEGRAM_API_URL}`);
 console.log(`✅ Proxy: ${PROXY_URL || 'Not set'}`);
