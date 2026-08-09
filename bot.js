@@ -7,10 +7,10 @@ const dns = require('dns');
 
 // ==================== CONFIGURATION FROM .env ====================
 const BOT_TOKEN = process.env.BOT_TOKEN;
-const ADMIN_IDS = process.env.ADMIN_IDS ? process.env.ADMIN_IDS.split(',') : [];
+const ADMIN_IDS = process.env.ADMIN_IDS ? process.env.ADMIN_IDS.split(',').map(id => id.trim()) : [];
 const GROUP_CHAT_ID = process.env.GROUP_CHAT_ID || null;
 const PORT = process.env.PORT || 3000;
-const ALLOWED_GROUP_IDS = process.env.ALLOWED_GROUP_IDS ? process.env.ALLOWED_GROUP_IDS.split(',') : [];
+const ALLOWED_GROUP_IDS = process.env.ALLOWED_GROUP_IDS ? process.env.ALLOWED_GROUP_IDS.split(',').map(id => id.trim()) : [];
 const REFERRAL_CHANNEL_ID = process.env.REFERRAL_CHANNEL_ID || null;
 const PROXY_URL = process.env.PROXY_URL || null;
 const TELEGRAM_API_URL = process.env.TELEGRAM_API_URL || 'https://api.telegram.org';
@@ -24,6 +24,17 @@ const app = express();
 const employees = {};
 const pendingUsers = {};
 const verifiedUsers = new Set();
+
+// ✅ Auto-verify admins
+ADMIN_IDS.forEach(adminId => {
+    if (adminId) {
+        verifiedUsers.add(adminId);
+        console.log(`✅ Admin ${adminId} auto-verified`);
+    }
+});
+
+console.log(`✅ Total admins: ${ADMIN_IDS.length}`);
+console.log(`✅ Admins: ${ADMIN_IDS.join(', ')}`);
 
 // ==================== DNS Pre-resolution ====================
 console.log('🔍 Resolving Telegram API domain...');
@@ -40,13 +51,11 @@ function getProxyAgent() {
     if (!PROXY_URL) return null;
     
     try {
-        // For HTTP/HTTPS proxies
         if (PROXY_URL.startsWith('http://') || PROXY_URL.startsWith('https://')) {
             const { HttpsProxyAgent } = require('https-proxy-agent');
             console.log(`✅ Using HTTP proxy: ${PROXY_URL}`);
             return new HttpsProxyAgent(PROXY_URL);
         }
-        // For SOCKS5 proxies
         else if (PROXY_URL.startsWith('socks5://') || PROXY_URL.startsWith('socks://')) {
             const { SocksProxyAgent } = require('socks-proxy-agent');
             console.log(`✅ Using SOCKS5 proxy: ${PROXY_URL}`);
@@ -81,7 +90,6 @@ function createBot() {
             }
         };
 
-        // Add proxy if configured
         const agent = getProxyAgent();
         if (agent) {
             botOptions.request = { agent: agent };
@@ -157,11 +165,9 @@ function reconnectBot() {
                 return;
             }
             
-            // Setup error handlers for new bot
             bot.on('polling_error', handlePollingError);
             bot.on('error', handleBotError);
             
-            // Wait for connection
             await new Promise(resolve => setTimeout(resolve, 2000));
             
             try {
@@ -169,8 +175,6 @@ function reconnectBot() {
                 console.log(`✅ Bot reconnected successfully! (${me.username})`);
                 retryCount = 0;
                 pollingActive = true;
-                
-                // Re-setup all command handlers
                 setupCommandHandlers();
             } catch (err) {
                 console.log('⚠️ Bot instance created but connection failed:', err.message);
@@ -183,10 +187,7 @@ function reconnectBot() {
     }, delay);
 }
 
-// ==================== SETUP COMMAND HANDLERS ====================
 function setupCommandHandlers() {
-    // Setup all the command handlers here
-    // This function will be called again on reconnection
     console.log('🔄 Setting up command handlers...');
 }
 
@@ -199,7 +200,6 @@ if (!bot) {
     process.exit(1);
 }
 
-// Setup error handlers
 bot.on('polling_error', handlePollingError);
 bot.on('error', handleBotError);
 
@@ -229,7 +229,6 @@ function startHeartbeat() {
     }, 30000);
 }
 
-// Start heartbeat after bot is ready
 setTimeout(startHeartbeat, 5000);
 
 // ==================== EXPRESS SERVER ====================
@@ -343,15 +342,25 @@ function getLateDurationFormatted(startTimestamp) {
 // ==================== GROUP & CHANNEL VERIFICATION FUNCTIONS ====================
 
 async function isUserMemberOfChannel(userId) {
+    // ✅ Skip channel check if no channel is configured
     if (!REFERRAL_CHANNEL_ID) {
+        return true;
+    }
+
+    // ✅ Skip channel check for admins
+    if (ADMIN_IDS.includes(userId)) {
+        console.log(`[VERIFICATION] Admin ${userId} bypassed channel check`);
         return true;
     }
 
     try {
         const chatMember = await bot.getChatMember(REFERRAL_CHANNEL_ID, userId);
-        return chatMember.status !== 'left' && chatMember.status !== 'kicked';
+        const isMember = chatMember.status !== 'left' && chatMember.status !== 'kicked';
+        console.log(`[VERIFICATION] User ${userId} channel member: ${isMember}`);
+        return isMember;
     } catch (error) {
         console.log(`[VERIFICATION] Failed to check membership for user ${userId}:`, error.message);
+        // If we can't check, assume they're not a member
         return false;
     }
 }
@@ -396,6 +405,12 @@ async function sendVerificationRequest(chatId, userId) {
 async function verifyUserAndGroup(msg) {
     const chatId = msg.chat.id;
     const userId = msg.from ? msg.from.id.toString() : null;
+    
+    // ✅ Check if user is admin (skip all verification)
+    if (userId && ADMIN_IDS.includes(userId)) {
+        console.log(`[VERIFICATION] Admin ${userId} auto-verified`);
+        return true;
+    }
     
     if (isGroup(msg.chat)) {
         if (!isGroupAllowed(chatId)) {
@@ -588,6 +603,18 @@ bot.on('callback_query', async (callbackQuery) => {
     const data = callbackQuery.data;
 
     if (data === 'verify_membership') {
+        // ✅ Skip verification for admins
+        if (ADMIN_IDS.includes(userId)) {
+            verifiedUsers.add(userId);
+            delete pendingUsers[userId];
+            await bot.answerCallbackQuery(callbackQuery.id, '✅ Admin auto-verified!');
+            await bot.sendMessage(chatId, '✅ *Admin Verified!*\n\nYou are an admin, so you\'re automatically verified.', { 
+                parse_mode: 'Markdown',
+                ...mainKeyboard 
+            });
+            return;
+        }
+
         const isMember = await isUserMemberOfChannel(userId);
         
         if (isMember) {
@@ -635,7 +662,7 @@ Activity Limit: 15 minutes
 *Verification:*
 - Groups: Must be allowed by admin
 - Personal: Must join referral channel
-- One-time verification only`;
+- Admins: Auto-verified`;
     try {
         await bot.sendMessage(chatId, helpMessage, { parse_mode: 'Markdown' });
     } catch (error) {
@@ -809,6 +836,14 @@ bot.onText(/\/report/, async (msg) => {
 async function handleButtonWithVerification(msg, callback) {
     const chatId = msg.chat.id;
     const isGroupChat = isGroup(msg.chat);
+    const userId = msg.from ? msg.from.id.toString() : null;
+    
+    // ✅ Skip verification for admins
+    if (userId && ADMIN_IDS.includes(userId)) {
+        console.log(`[BUTTON] Admin ${userId} bypassed verification`);
+        await callback();
+        return;
+    }
     
     if (isGroupChat) {
         if (!isGroupAllowed(chatId)) {
@@ -1090,7 +1125,6 @@ setTimeout(async () => {
         }
     } catch (err) {
         console.log('⚠️ Initial connection check failed, will retry...');
-        // Try to reconnect if initial connection fails
         reconnectBot();
     }
 }, 3000);
