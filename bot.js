@@ -8,7 +8,6 @@ const dns = require('dns');
 const BOT_TOKEN = process.env.BOT_TOKEN;
 const SUPER_ADMIN_IDS = process.env.SUPER_ADMIN_IDS ? process.env.SUPER_ADMIN_IDS.split(',').map(id => id.trim()) : [];
 const PORT = process.env.PORT || 3000;
-const GROUP_CHAT_ID = process.env.GROUP_CHAT_ID || null;
 const REFERRAL_CHANNEL_ID = process.env.REFERRAL_CHANNEL_ID || null;
 const PROXY_URL = process.env.PROXY_URL || null;
 const TELEGRAM_API_URL = process.env.TELEGRAM_API_URL || 'https://api.telegram.org';
@@ -254,7 +253,7 @@ app.get('/health', (req, res) => {
         pendingGroups: Object.keys(pendingGroups).length,
         normalAdmins: normalAdmins.size,
         superAdmins: superAdmins.size,
-        version: '4.0',
+        version: '4.1',
         connection: {
             status: pollingActive ? 'connected' : 'disconnected',
             proxy: PROXY_URL ? 'configured' : 'none',
@@ -385,7 +384,7 @@ function getLateDurationFormatted(startTimestamp) {
     return formatDurationWithSeconds(getLateDuration(startTimestamp));
 }
 
-// ==================== GROUP & CHANNEL VERIFICATION FUNCTIONS ====================
+// ==================== VERIFICATION FUNCTIONS ====================
 
 async function isUserMemberOfChannel(userId) {
     if (!REFERRAL_CHANNEL_ID) {
@@ -454,86 +453,70 @@ async function sendVerificationRequest(chatId, userId) {
     }
 }
 
-async function verifyUserAndGroup(msg) {
+async function verifyGroupAndUsers(msg) {
     const chatId = msg.chat.id;
     const userId = msg.from ? msg.from.id.toString() : null;
     const isGroupChat = isGroup(msg.chat);
     const groupIdStr = chatId.toString();
     
-    // Admin check
-    if (userId && isAdmin(userId)) {
-        console.log(`[VERIFICATION] Admin ${userId} auto-verified`);
-        return true;
-    }
-    
-    if (userId && manuallyVerified.has(userId)) {
-        verifiedUsers.add(userId);
-        return true;
-    }
-    
-    // GROUP CHAT VERIFICATION
-    if (isGroupChat) {
-        // Check if group is already approved
-        if (approvedGroups.has(groupIdStr)) {
-            if (userId && !verifiedUsers.has(userId)) {
-                verifiedUsers.add(userId);
-                console.log(`[VERIFICATION] Auto-verified user ${userId} via approved group ${chatId}`);
-            }
-            return true;
-        }
-        
-        // Check if group is pending
-        if (pendingGroups[groupIdStr]) {
+    // If it's not a group chat, just verify the user
+    if (!isGroupChat) {
+        if (!userId) {
             try {
-                await bot.sendMessage(chatId, '⏳ *Your group is pending admin approval.*\n\nPlease wait for the admin to approve this group.', { parse_mode: 'Markdown' });
+                await bot.sendMessage(chatId, '❌ Could not identify you. Please try again.');
             } catch (e) {}
             return false;
         }
         
-        // New group - check if the user is an admin
-        if (userId && isAdmin(userId)) {
-            // Check if this admin already has a group
-            if (normalAdmins.has(userId) && normalAdmins.get(userId)) {
-                const existingGroup = normalAdmins.get(userId);
-                const groupMessage = `❌ *You already have an active group!*\n\n` +
-                    `You can only have ONE active group at a time.\n\n` +
-                    `📋 Your current group ID: \`${existingGroup}\`\n\n` +
-                    `To approve this new group, you must first revoke your current group:\n` +
-                    `🔄 /revokegroup\n\n` +
-                    `After revoking, you can approve a new group.`;
-                
-                try {
-                    await bot.sendMessage(chatId, groupMessage, { parse_mode: 'Markdown' });
-                } catch (error) {
-                    console.error(`[GROUP] Failed to send message to group ${chatId}:`, error.message);
-                }
-                
-                try {
-                    await bot.sendMessage(userId, `❌ *Cannot approve new group*\n\n` +
-                        `You already have an active group: \`${existingGroup}\`\n\n` +
-                        `Please use /revokegroup to revoke your current group first, then try again.`, 
-                        { parse_mode: 'Markdown' }
-                    );
-                } catch (err) {
-                    console.log(`Failed to notify admin ${userId}:`, err.message);
-                }
+        if (verifiedUsers.has(userId) || isAdmin(userId) || manuallyVerified.has(userId)) {
+            verifiedUsers.add(userId);
+            return true;
+        }
+        
+        if (pendingUsers[userId]) {
+            const timeElapsed = Date.now() - pendingUsers[userId].timestamp;
+            if (timeElapsed > 300000) {
+                delete pendingUsers[userId];
+                await sendVerificationRequest(chatId, userId);
                 return false;
             }
-            
-            // Admin has no group - add to pending
-            pendingGroups[groupIdStr] = {
-                timestamp: Date.now(),
-                chatId: chatId,
-                adminId: userId
-            };
-            
-            const groupMessage = `🔐 *Group Verification Required*\n\n` +
-                `This group needs approval from the admin who added the bot.\n\n` +
-                `📋 *Group ID:* \`${groupIdStr}\`\n` +
-                `👤 *Admin ID:* \`${userId}\`\n\n` +
-                `To approve this group, use:\n` +
-                `/approvegroup ${groupIdStr}\n\n` +
-                `*Note:* Each admin can approve ONLY ONE group at a time.`;
+            return false;
+        }
+        
+        await sendVerificationRequest(chatId, userId);
+        pendingUsers[userId] = { timestamp: Date.now() };
+        return false;
+    }
+    
+    // GROUP CHAT - Check if group is approved
+    if (approvedGroups.has(groupIdStr)) {
+        // Group is approved - auto-verify all users in this group
+        if (userId) {
+            verifiedUsers.add(userId);
+            console.log(`[VERIFICATION] Auto-verified user ${userId} in approved group ${chatId}`);
+        }
+        return true;
+    }
+    
+    // Check if group is pending
+    if (pendingGroups[groupIdStr]) {
+        try {
+            await bot.sendMessage(chatId, '⏳ *Your group is pending admin approval.*\n\nPlease wait for the admin to approve this group.', { parse_mode: 'Markdown' });
+        } catch (e) {}
+        return false;
+    }
+    
+    // New group - only admins can request approval
+    if (userId && isAdmin(userId)) {
+        // Check if this admin already has a group
+        if (normalAdmins.has(userId) && normalAdmins.get(userId)) {
+            const existingGroup = normalAdmins.get(userId);
+            const groupMessage = `❌ *You already have an active group!*\n\n` +
+                `You can only have ONE active group at a time.\n\n` +
+                `📋 Your current group ID: \`${existingGroup}\`\n\n` +
+                `To approve this new group, you must first revoke your current group:\n` +
+                `🔄 /revokegroup\n\n` +
+                `After revoking, you can approve a new group.`;
             
             try {
                 await bot.sendMessage(chatId, groupMessage, { parse_mode: 'Markdown' });
@@ -541,93 +524,99 @@ async function verifyUserAndGroup(msg) {
                 console.error(`[GROUP] Failed to send message to group ${chatId}:`, error.message);
             }
             
-            // Notify the admin
             try {
-                await bot.sendMessage(userId, `🔔 *New Group Verification Request*\n\n` +
-                    `📋 *Group ID:* \`${groupIdStr}\`\n` +
-                    `🕐 *Requested at:* ${new Date().toLocaleString()}\n\n` +
-                    `To approve this group, use:\n` +
-                    `/approvegroup ${groupIdStr}\n\n` +
-                    `*Note:* You can approve ONLY ONE group at a time.`, 
+                await bot.sendMessage(userId, `❌ *Cannot approve new group*\n\n` +
+                    `You already have an active group: \`${existingGroup}\`\n\n` +
+                    `Please use /revokegroup to revoke your current group first, then try again.`, 
                     { parse_mode: 'Markdown' }
                 );
             } catch (err) {
                 console.log(`Failed to notify admin ${userId}:`, err.message);
             }
-            
-            // Notify super admins
-            for (const superAdminId of SUPER_ADMIN_IDS) {
-                try {
-                    await bot.sendMessage(superAdminId, 
-                        `🔔 *New Group Verification Request*\n\n` +
-                        `Group ID: \`${groupIdStr}\`\n` +
-                        `Requested by Admin: \`${userId}\`\n` +
-                        `Time: ${new Date().toLocaleString()}`,
-                        { parse_mode: 'Markdown' }
-                    );
-                } catch (err) {
-                    console.log(`Failed to notify super admin ${superAdminId}:`, err.message);
-                }
-            }
-            
-            console.log(`[GROUP] Group ${groupIdStr} pending approval by admin ${userId}`);
-            return false;
-        } else {
-            // Non-admin user added the bot
-            const groupMessage = `🔐 *Group Verification Required*\n\n` +
-                `This group needs to be approved by an admin.\n\n` +
-                `📋 *Group ID:* \`${groupIdStr}\`\n\n` +
-                `Please contact an admin to approve this group.`;
-            
-            try {
-                await bot.sendMessage(chatId, groupMessage, { parse_mode: 'Markdown' });
-            } catch (error) {
-                console.error(`[GROUP] Failed to send message to group ${chatId}:`, error.message);
-            }
-            
-            // Notify super admins
-            for (const superAdminId of SUPER_ADMIN_IDS) {
-                try {
-                    await bot.sendMessage(superAdminId, 
-                        `🔔 *Group Needs Admin Approval*\n\n` +
-                        `Group ID: \`${groupIdStr}\`\n` +
-                        `Added by non-admin user: ${userId || 'Unknown'}\n\n` +
-                        `A super admin or normal admin needs to approve this group.`,
-                        { parse_mode: 'Markdown' }
-                    );
-                } catch (err) {
-                    console.log(`Failed to notify super admin ${superAdminId}:`, err.message);
-                }
-            }
             return false;
         }
-    }
-    
-    // PERSONAL CHAT VERIFICATION
-    if (!userId) {
+        
+        // Admin has no group - add to pending
+        pendingGroups[groupIdStr] = {
+            timestamp: Date.now(),
+            chatId: chatId,
+            adminId: userId
+        };
+        
+        const groupMessage = `🔐 *Group Verification Required*\n\n` +
+            `This group needs approval from the admin who added the bot.\n\n` +
+            `📋 *Group ID:* \`${groupIdStr}\`\n` +
+            `👤 *Admin ID:* \`${userId}\`\n\n` +
+            `To approve this group, use:\n` +
+            `/approvegroup ${groupIdStr}\n\n` +
+            `*Note:* Each admin can approve ONLY ONE group at a time.`;
+        
         try {
-            await bot.sendMessage(chatId, '❌ Could not identify you. Please try again.');
-        } catch (e) {}
+            await bot.sendMessage(chatId, groupMessage, { parse_mode: 'Markdown' });
+        } catch (error) {
+            console.error(`[GROUP] Failed to send message to group ${chatId}:`, error.message);
+        }
+        
+        // Notify the admin
+        try {
+            await bot.sendMessage(userId, `🔔 *New Group Verification Request*\n\n` +
+                `📋 *Group ID:* \`${groupIdStr}\`\n` +
+                `🕐 *Requested at:* ${new Date().toLocaleString()}\n\n` +
+                `To approve this group, use:\n` +
+                `/approvegroup ${groupIdStr}\n\n` +
+                `*Note:* You can approve ONLY ONE group at a time.`, 
+                { parse_mode: 'Markdown' }
+            );
+        } catch (err) {
+            console.log(`Failed to notify admin ${userId}:`, err.message);
+        }
+        
+        // Notify super admins
+        for (const superAdminId of SUPER_ADMIN_IDS) {
+            try {
+                await bot.sendMessage(superAdminId, 
+                    `🔔 *New Group Verification Request*\n\n` +
+                    `Group ID: \`${groupIdStr}\`\n` +
+                    `Requested by Admin: \`${userId}\`\n` +
+                    `Time: ${new Date().toLocaleString()}`,
+                    { parse_mode: 'Markdown' }
+                );
+            } catch (err) {
+                console.log(`Failed to notify super admin ${superAdminId}:`, err.message);
+            }
+        }
+        
+        console.log(`[GROUP] Group ${groupIdStr} pending approval by admin ${userId}`);
         return false;
-    }
-    
-    if (verifiedUsers.has(userId)) {
-        return true;
-    }
-    
-    if (pendingUsers[userId]) {
-        const timeElapsed = Date.now() - pendingUsers[userId].timestamp;
-        if (timeElapsed > 300000) {
-            delete pendingUsers[userId];
-            await sendVerificationRequest(chatId, userId);
-            return false;
+    } else {
+        // Non-admin user added the bot - notify admins
+        const groupMessage = `🔐 *Group Verification Required*\n\n` +
+            `This group needs to be approved by an admin.\n\n` +
+            `📋 *Group ID:* \`${groupIdStr}\`\n\n` +
+            `Please contact an admin to approve this group.`;
+        
+        try {
+            await bot.sendMessage(chatId, groupMessage, { parse_mode: 'Markdown' });
+        } catch (error) {
+            console.error(`[GROUP] Failed to send message to group ${chatId}:`, error.message);
+        }
+        
+        // Notify super admins
+        for (const superAdminId of SUPER_ADMIN_IDS) {
+            try {
+                await bot.sendMessage(superAdminId, 
+                    `🔔 *Group Needs Admin Approval*\n\n` +
+                    `Group ID: \`${groupIdStr}\`\n` +
+                    `Added by non-admin user: ${userId || 'Unknown'}\n\n` +
+                    `A super admin or normal admin needs to approve this group.`,
+                    { parse_mode: 'Markdown' }
+                );
+            } catch (err) {
+                console.log(`Failed to notify super admin ${superAdminId}:`, err.message);
+            }
         }
         return false;
     }
-    
-    await sendVerificationRequest(chatId, userId);
-    pendingUsers[userId] = { timestamp: Date.now() };
-    return false;
 }
 
 // ==================== NOTIFICATION FUNCTIONS ====================
@@ -889,8 +878,34 @@ bot.onText(/\/approvegroup (.+)/, async (msg, match) => {
     
     // Check if group is pending
     if (!pendingGroups[groupId]) {
-        await bot.sendMessage(msg.chat.id, `❌ Group ${groupId} is not pending approval.\n\nTo request approval:\n1. Add bot to the group\n2. Send /start in the group`);
-        return;
+        // Try to approve it anyway - maybe it's already working
+        // Check if the group exists and we can send a message to it
+        try {
+            await bot.sendMessage(groupId, '✅ *Group Approved!*\n\nThis group has been approved and can now use the bot.\n\nUse the buttons below to start tracking attendance.', { 
+                parse_mode: 'Markdown',
+                ...mainKeyboard 
+            });
+            
+            // Approve the group
+            approvedGroups.add(groupId);
+            
+            if (isNormalAdmin(userId)) {
+                normalAdmins.set(userId, groupId);
+                adminGroups.set(groupId, userId);
+                groupApprovedBy.set(groupId, userId);
+            } else {
+                groupApprovedBy.set(groupId, 'super_admin');
+                adminGroups.set(groupId, 'super_admin');
+            }
+            
+            const adminType = isSuperAdmin(userId) ? 'Super Admin' : 'Admin';
+            await bot.sendMessage(msg.chat.id, `✅ Group ${groupId} has been approved by ${adminType}!`);
+            await sendAdminNotification(`✅ *Group Approved*\n\nGroup ID: ${groupId}\nApproved by: ${msg.from.first_name}\nAdmin Type: ${adminType}`);
+            return;
+        } catch (err) {
+            await bot.sendMessage(msg.chat.id, `❌ Group ${groupId} is not pending approval.\n\nTo request approval:\n1. Add bot to the group\n2. Send /start in the group`);
+            return;
+        }
     }
     
     // Check if this is the admin who should approve this group
@@ -1366,7 +1381,8 @@ bot.onText(/\/help/, async (msg) => {
         helpMessage += `↩️ 返回 - Return from break\n\n`;
         helpMessage += `*Verification:*\n`;
         helpMessage += `- Personal chat: Must join referral channel\n`;
-        helpMessage += `- Groups: Must be approved by admin`;
+        helpMessage += `- Groups: Must be approved by admin\n`;
+        helpMessage += `- Once group is approved, ALL members can use the bot`;
     }
     
     try {
@@ -1382,7 +1398,8 @@ bot.onText(/\/start/, async (msg) => {
     const userId = msg.from ? msg.from.id.toString() : null;
     
     if (isGroupChat) {
-        const verified = await verifyUserAndGroup(msg);
+        // Use the new verification function that handles groups properly
+        const verified = await verifyGroupAndUsers(msg);
         if (!verified) {
             return;
         }
@@ -1394,7 +1411,8 @@ bot.onText(/\/start/, async (msg) => {
         return;
     }
     
-    const verified = await verifyUserAndGroup(msg);
+    // Personal chat - verify user
+    const verified = await verifyGroupAndUsers(msg);
     if (!verified) {
         return;
     }
@@ -1442,7 +1460,7 @@ bot.onText(/\/status/, async (msg) => {
     }
     
     if (!isGroupChat) {
-        const verified = await verifyUserAndGroup(msg);
+        const verified = await verifyGroupAndUsers(msg);
         if (!verified) return;
     }
     
@@ -1561,7 +1579,7 @@ bot.onText(/\/report/, async (msg) => {
     }
     
     if (!isGroupChat) {
-        const verified = await verifyUserAndGroup(msg);
+        const verified = await verifyGroupAndUsers(msg);
         if (!verified) return;
     }
     
@@ -1665,12 +1683,14 @@ async function handleButtonWithVerification(msg, callback) {
     const isGroupChat = isGroup(msg.chat);
     const userId = msg.from ? msg.from.id.toString() : null;
     
+    // Admins bypass verification
     if (userId && isAdmin(userId)) {
         console.log(`[BUTTON] Admin ${userId} bypassed verification`);
         await callback();
         return;
     }
     
+    // Group chat - check if group is approved
     if (isGroupChat) {
         if (!isGroupAllowed(chatId)) {
             try {
@@ -1678,11 +1698,16 @@ async function handleButtonWithVerification(msg, callback) {
             } catch (e) {}
             return;
         }
+        // ✅ Auto-verify all users in approved groups
+        if (userId) {
+            verifiedUsers.add(userId);
+        }
         await callback();
         return;
     }
     
-    const verified = await verifyUserAndGroup(msg);
+    // Personal chat - verify user
+    const verified = await verifyGroupAndUsers(msg);
     if (!verified) return;
     await callback();
 }
@@ -1947,7 +1972,7 @@ process.on('SIGINT', () => {
 });
 
 // ==================== STARTUP ====================
-console.log('🚀 Starting Employee Attendance Bot v4.0');
+console.log('🚀 Starting Employee Attendance Bot v4.1');
 console.log('================================================');
 console.log(`✅ Timezone: ${MEXICO_TIMEZONE}`);
 console.log(`✅ Work start: ${WORK_START_HOUR}:${WORK_START_MINUTE} AM`);
