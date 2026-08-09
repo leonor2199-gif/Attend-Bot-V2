@@ -344,6 +344,7 @@ function getLateDurationFormatted(startTimestamp) {
 async function isUserMemberOfChannel(userId) {
     // ✅ Skip channel check if no channel is configured
     if (!REFERRAL_CHANNEL_ID) {
+        console.log(`[VERIFICATION] No channel configured, allowing user ${userId}`);
         return true;
     }
 
@@ -354,13 +355,38 @@ async function isUserMemberOfChannel(userId) {
     }
 
     try {
-        const chatMember = await bot.getChatMember(REFERRAL_CHANNEL_ID, userId);
-        const isMember = chatMember.status !== 'left' && chatMember.status !== 'kicked';
-        console.log(`[VERIFICATION] User ${userId} channel member: ${isMember}`);
-        return isMember;
+        // Try multiple methods to check membership
+        
+        // Method 1: Direct getChatMember (works for public channels and if bot is admin)
+        try {
+            const chatMember = await bot.getChatMember(REFERRAL_CHANNEL_ID, userId);
+            const isMember = chatMember.status !== 'left' && chatMember.status !== 'kicked';
+            console.log(`[VERIFICATION] User ${userId} channel member (method 1): ${isMember}`);
+            if (isMember) return true;
+        } catch (err) {
+            console.log(`[VERIFICATION] Method 1 failed for user ${userId}:`, err.message);
+        }
+
+        // Method 2: Try to get chat and check if user is in the chat list (for public channels)
+        try {
+            const chat = await bot.getChat(REFERRAL_CHANNEL_ID);
+            if (chat && chat.username) {
+                // Try to get the user's chat member status using the chat ID
+                const chatMember = await bot.getChatMember(chat.id, userId);
+                const isMember = chatMember.status !== 'left' && chatMember.status !== 'kicked';
+                console.log(`[VERIFICATION] User ${userId} channel member (method 2): ${isMember}`);
+                if (isMember) return true;
+            }
+        } catch (err) {
+            console.log(`[VERIFICATION] Method 2 failed for user ${userId}:`, err.message);
+        }
+
+        // Method 3: If channel is private and bot is not admin, we can't check
+        // In this case, we'll allow the user if they clicked the verify button
+        console.log(`[VERIFICATION] Could not verify user ${userId} membership. Channel might be private or bot lacks permissions.`);
+        return false;
     } catch (error) {
         console.log(`[VERIFICATION] Failed to check membership for user ${userId}:`, error.message);
-        // If we can't check, assume they're not a member
         return false;
     }
 }
@@ -378,6 +404,20 @@ function isGroup(chat) {
 }
 
 async function sendVerificationRequest(chatId, userId) {
+    // ✅ If no channel is configured, skip verification
+    if (!REFERRAL_CHANNEL_ID) {
+        console.log(`[VERIFICATION] No channel configured, auto-verifying user ${userId}`);
+        verifiedUsers.add(userId);
+        return;
+    }
+
+    // ✅ Skip for admins
+    if (ADMIN_IDS.includes(userId)) {
+        console.log(`[VERIFICATION] Admin ${userId} auto-verified`);
+        verifiedUsers.add(userId);
+        return;
+    }
+
     let message = '🔐 *Verification Required*\n\n';
     message += 'To use this bot, you must join our referral channel:\n';
     message += `📢 Channel: [Click here to join](https://t.me/${REFERRAL_CHANNEL_ID.replace('@', '')})\n\n`;
@@ -409,6 +449,13 @@ async function verifyUserAndGroup(msg) {
     // ✅ Check if user is admin (skip all verification)
     if (userId && ADMIN_IDS.includes(userId)) {
         console.log(`[VERIFICATION] Admin ${userId} auto-verified`);
+        return true;
+    }
+    
+    // ✅ If no channel is configured, auto-verify everyone
+    if (!REFERRAL_CHANNEL_ID) {
+        console.log(`[VERIFICATION] No channel configured, auto-verifying everyone`);
+        if (userId) verifiedUsers.add(userId);
         return true;
     }
     
@@ -615,6 +662,18 @@ bot.on('callback_query', async (callbackQuery) => {
             return;
         }
 
+        // ✅ If no channel is configured, auto-verify
+        if (!REFERRAL_CHANNEL_ID) {
+            verifiedUsers.add(userId);
+            delete pendingUsers[userId];
+            await bot.answerCallbackQuery(callbackQuery.id, '✅ Auto-verified!');
+            await bot.sendMessage(chatId, '✅ *Verification Successful!*\n\nYou can now use the bot. Click /start to begin.', { 
+                parse_mode: 'Markdown',
+                ...mainKeyboard 
+            });
+            return;
+        }
+
         const isMember = await isUserMemberOfChannel(userId);
         
         if (isMember) {
@@ -629,9 +688,27 @@ bot.on('callback_query', async (callbackQuery) => {
             
             console.log(`[VERIFICATION] User ${userId} verified via channel membership`);
         } else {
-            await bot.answerCallbackQuery(callbackQuery.id, '❌ You haven\'t joined the channel yet!');
-            await bot.sendMessage(chatId, '❌ You are not a member of the referral channel. Please join first and try again.');
-            await sendVerificationRequest(chatId, userId);
+            await bot.answerCallbackQuery(callbackQuery.id, '❌ Verification failed. Please try again.');
+            
+            // Give the user another option - manual verification by admin
+            const manualMessage = `⚠️ *Unable to verify your membership automatically.*\n\n` +
+                `Please try these steps:\n` +
+                `1. Make sure you've joined the channel: @${REFERRAL_CHANNEL_ID.replace('@', '')}\n` +
+                `2. Wait a few seconds and click the "I have joined" button again\n` +
+                `3. If it still doesn't work, contact the admin for manual verification.\n\n` +
+                `*Admin ID:* ${ADMIN_IDS.join(', ')}`;
+            
+            await bot.sendMessage(chatId, manualMessage, { parse_mode: 'Markdown' });
+            
+            // Send notification to admins about verification issue
+            if (ADMIN_IDS.length > 0) {
+                const adminNotify = `⚠️ *Verification Issue*\n\n` +
+                    `User ID: ${userId}\n` +
+                    `Name: ${callbackQuery.from.first_name}\n` +
+                    `Failed to verify channel membership.\n\n` +
+                    `Please manually verify this user or check the channel settings.`;
+                await sendNotification(adminNotify, 'Markdown');
+            }
         }
     }
 });
