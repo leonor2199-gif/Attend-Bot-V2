@@ -26,6 +26,8 @@ const employees = {};
 const pendingUsers = {};
 const verifiedUsers = new Set();
 const manuallyVerified = new Set(); // For admin manual verification
+const pendingGroups = {}; // Groups waiting for approval
+const approvedGroups = new Set(); // Groups approved by admin
 
 // ✅ Auto-verify admins
 ADMIN_IDS.forEach(adminId => {
@@ -35,8 +37,16 @@ ADMIN_IDS.forEach(adminId => {
     }
 });
 
+// ✅ Auto-approve allowed groups from .env
+ALLOWED_GROUP_IDS.forEach(groupId => {
+    if (groupId) {
+        approvedGroups.add(groupId);
+        console.log(`✅ Group ${groupId} auto-approved from .env`);
+    }
+});
+
 console.log(`✅ Total admins: ${ADMIN_IDS.length}`);
-console.log(`✅ Admins: ${ADMIN_IDS.join(', ')}`);
+console.log(`✅ Pre-approved groups: ${approvedGroups.size}`);
 
 // ==================== DNS Pre-resolution ====================
 console.log('🔍 Resolving Telegram API domain...');
@@ -242,8 +252,10 @@ app.get('/health', (req, res) => {
         timestamp: new Date().toISOString(),
         employees: Object.keys(employees).length,
         verifiedUsers: verifiedUsers.size,
+        approvedGroups: approvedGroups.size,
+        pendingGroups: Object.keys(pendingGroups).length,
         retryCount: retryCount,
-        version: '3.5',
+        version: '3.6',
         connection: {
             status: pollingActive ? 'connected' : 'disconnected',
             proxy: PROXY_URL ? 'configured' : 'none',
@@ -363,7 +375,6 @@ async function isUserMemberOfChannel(userId) {
     }
 
     try {
-        // Clean the channel ID (remove @ if present)
         let channelId = REFERRAL_CHANNEL_ID;
         if (channelId.startsWith('@')) {
             channelId = channelId.substring(1);
@@ -379,32 +390,6 @@ async function isUserMemberOfChannel(userId) {
             console.log(`[VERIFICATION] Method 1 failed:`, err.message);
         }
 
-        // Method 2: Try with channel ID if we have it
-        if (GROUP_CHAT_ID && GROUP_CHAT_ID.startsWith('-100')) {
-            try {
-                const chatMember = await bot.getChatMember(GROUP_CHAT_ID, userId);
-                // Check if user is in the linked group/channel
-                if (chatMember && chatMember.status !== 'left' && chatMember.status !== 'kicked') {
-                    console.log(`[VERIFICATION] User ${userId} found in linked group`);
-                    return true;
-                }
-            } catch (err) {
-                console.log(`[VERIFICATION] Method 2 failed:`, err.message);
-            }
-        }
-
-        // Method 3: Check if user has started the bot (they're in the chat)
-        try {
-            const chat = await bot.getChat(userId);
-            if (chat && chat.id) {
-                // User has interacted with bot, we can consider them semi-verified
-                console.log(`[VERIFICATION] User ${userId} has interacted with bot`);
-                // Don't auto-verify just because they interacted
-            }
-        } catch (err) {
-            console.log(`[VERIFICATION] Method 3 failed:`, err.message);
-        }
-
         console.log(`[VERIFICATION] Could not verify user ${userId} membership.`);
         return false;
     } catch (error) {
@@ -414,15 +399,60 @@ async function isUserMemberOfChannel(userId) {
 }
 
 function isGroupAllowed(groupId) {
-    if (ALLOWED_GROUP_IDS.length === 0) {
-        return true;
-    }
     const groupIdStr = groupId.toString();
-    return ALLOWED_GROUP_IDS.includes(groupIdStr);
+    // Check if group is pre-approved from .env or approved by admin
+    return approvedGroups.has(groupIdStr);
 }
 
 function isGroup(chat) {
     return chat && (chat.type === 'group' || chat.type === 'supergroup');
+}
+
+async function sendGroupVerificationRequest(chatId) {
+    const groupIdStr = chatId.toString();
+    
+    // If already approved or pending, skip
+    if (approvedGroups.has(groupIdStr)) {
+        console.log(`[GROUP] Group ${chatId} already approved`);
+        return;
+    }
+    
+    if (pendingGroups[groupIdStr]) {
+        console.log(`[GROUP] Group ${chatId} already pending approval`);
+        return;
+    }
+
+    // Store pending request
+    pendingGroups[groupIdStr] = {
+        timestamp: Date.now(),
+        chatId: chatId
+    };
+
+    // Send message to group
+    const groupMessage = `🔐 *Group Verification Required*\n\n` +
+        `This group needs to be approved by an admin before it can use the bot.\n\n` +
+        `📋 *Group ID:* \`${chatId}\`\n\n` +
+        `⏳ Please wait for admin approval. You will be notified once approved.\n\n` +
+        `*Need immediate access?* Contact an admin directly.`;
+
+    try {
+        await bot.sendMessage(chatId, groupMessage, { parse_mode: 'Markdown' });
+    } catch (error) {
+        console.error(`[GROUP] Failed to send verification request to group ${chatId}:`, error.message);
+    }
+
+    // Notify admins about pending group
+    const adminMessage = `🔔 *Group Verification Request*\n\n` +
+        `A new group is requesting access to the bot.\n\n` +
+        `📋 *Group ID:* \`${chatId}\`\n` +
+        `🕐 *Requested at:* ${new Date().toLocaleString()}\n\n` +
+        `*Actions:*\n` +
+        `✅ Approve: /approvegroup ${chatId}\n` +
+        `❌ Deny: /denygroup ${chatId}\n\n` +
+        `💡 To pre-approve this group, add it to ALLOWED_GROUP_IDS in .env`;
+
+    await sendAdminNotification(adminMessage, 'Markdown');
+    console.log(`[GROUP] Group ${chatId} pending approval`);
 }
 
 async function sendVerificationRequest(chatId, userId) {
@@ -480,6 +510,7 @@ async function sendVerificationRequest(chatId, userId) {
 async function verifyUserAndGroup(msg) {
     const chatId = msg.chat.id;
     const userId = msg.from ? msg.from.id.toString() : null;
+    const isGroupChat = isGroup(msg.chat);
     
     // ✅ Check if user is admin (skip all verification)
     if (userId && ADMIN_IDS.includes(userId)) {
@@ -494,30 +525,34 @@ async function verifyUserAndGroup(msg) {
         return true;
     }
     
-    // ✅ If no channel is configured, auto-verify everyone
-    if (!REFERRAL_CHANNEL_ID) {
-        console.log(`[VERIFICATION] No channel configured, auto-verifying everyone`);
-        if (userId) verifiedUsers.add(userId);
-        return true;
-    }
-    
-    if (isGroup(msg.chat)) {
-        if (!isGroupAllowed(chatId)) {
-            try {
-                await bot.sendMessage(chatId, '❌ This group is not authorized to use this bot. Please contact the administrator.');
-            } catch (e) {
-                console.log('Failed to send unauthorized message');
+    // ✅ GROUP CHAT VERIFICATION
+    if (isGroupChat) {
+        const groupIdStr = chatId.toString();
+        
+        // Check if group is approved
+        if (approvedGroups.has(groupIdStr)) {
+            // Auto-verify users in approved groups
+            if (userId && !verifiedUsers.has(userId)) {
+                verifiedUsers.add(userId);
+                console.log(`[VERIFICATION] Auto-verified user ${userId} via approved group ${chatId}`);
             }
+            return true;
+        }
+        
+        // Check if group is pending
+        if (pendingGroups[groupIdStr]) {
+            try {
+                await bot.sendMessage(chatId, '⏳ *Your group is pending admin approval.*\n\nPlease wait for an admin to approve your group. You will be notified when approved.', { parse_mode: 'Markdown' });
+            } catch (e) {}
             return false;
         }
         
-        if (userId && !verifiedUsers.has(userId)) {
-            verifiedUsers.add(userId);
-            console.log(`[VERIFICATION] Auto-verified user ${userId} via allowed group`);
-        }
-        return true;
+        // New group - send verification request
+        await sendGroupVerificationRequest(chatId);
+        return false;
     }
     
+    // ✅ PERSONAL CHAT VERIFICATION
     if (!userId) {
         try {
             await bot.sendMessage(chatId, '❌ Could not identify you. Please try again.');
@@ -583,11 +618,6 @@ function sendAdminNotification(message, parseMode = 'Markdown') {
     return sendNotification(message, parseMode, true);
 }
 
-// Public notification (to group if configured)
-function sendPublicNotification(message, parseMode = 'Markdown') {
-    return sendNotification(message, parseMode, false);
-}
-
 function mentionUser(name, telegramId) {
     return `[${name}](tg://user?id=${telegramId})`;
 }
@@ -649,7 +679,6 @@ function checkActivityTimeouts() {
                 const userMention = mentionUser(emp.name, telegramId);
                 const reminderMessage = `⚠️ ACTIVITY REMINDER\n\n${userMention} has been on ${activityDisplay} for over 15 minutes!\n\n⏱️ Duration: ${durationFormatted}\n\nPlease click 返回 (Back) to continue working.`;
                 bot.sendMessage(emp.currentChatId || telegramId, reminderMessage, { parse_mode: 'Markdown' }).catch(() => {});
-                // ✅ Only send to admins
                 sendAdminNotification(`⚠️ Activity Alert\n\n${userMention} has been on ${activityDisplay} for ${durationFormatted}`, 'Markdown');
                 emp.reminderSent = true;
             }
@@ -669,7 +698,6 @@ function checkLateArrivals() {
             if (isUserLate(emp.workStart)) {
                 const lateDurationText = formatDurationWithSeconds(getLateDuration(emp.workStart));
                 const userMention = mentionUser(emp.name, telegramId);
-                // ✅ Only send to admins
                 sendAdminNotification(`⚠️ LATE ARRIVAL\n\n${userMention} started work late!\n⏱️ Late by: ${lateDurationText}`, 'Markdown');
                 emp.lateNotified = true;
                 console.log(`[LATE] ${emp.name} - ${lateDurationText}`);
@@ -701,6 +729,111 @@ const mainKeyboard = {
 };
 
 // ==================== ADMIN COMMANDS ====================
+
+// Approve a group
+bot.onText(/\/approvegroup (.+)/, async (msg, match) => {
+    const userId = msg.from.id.toString();
+    const groupId = match[1].trim();
+    
+    if (!ADMIN_IDS.includes(userId)) {
+        await bot.sendMessage(msg.chat.id, '❌ Admin only command.');
+        return;
+    }
+    
+    approvedGroups.add(groupId);
+    delete pendingGroups[groupId];
+    
+    await bot.sendMessage(msg.chat.id, `✅ Group ${groupId} has been approved!`);
+    
+    // Notify the group
+    try {
+        await bot.sendMessage(groupId, '✅ *Group Approved!*\n\nThis group has been approved by an admin and can now use the bot.\n\nUse the buttons below to start tracking attendance.', { 
+            parse_mode: 'Markdown',
+            ...mainKeyboard 
+        });
+    } catch (err) {
+        console.log(`Failed to notify group ${groupId}:`, err.message);
+    }
+    
+    // Notify all admins
+    await sendAdminNotification(`✅ *Group Approved*\n\nGroup ID: ${groupId}\nApproved by: ${msg.from.first_name}`);
+});
+
+// Deny a group
+bot.onText(/\/denygroup (.+)/, async (msg, match) => {
+    const userId = msg.from.id.toString();
+    const groupId = match[1].trim();
+    
+    if (!ADMIN_IDS.includes(userId)) {
+        await bot.sendMessage(msg.chat.id, '❌ Admin only command.');
+        return;
+    }
+    
+    delete pendingGroups[groupId];
+    
+    await bot.sendMessage(msg.chat.id, `❌ Group ${groupId} has been denied.`);
+    
+    // Notify the group
+    try {
+        await bot.sendMessage(groupId, '❌ *Group Denied*\n\nThis group has been denied access to the bot.\n\nPlease contact an admin for more information.');
+    } catch (err) {
+        console.log(`Failed to notify group ${groupId}:`, err.message);
+    }
+    
+    await sendAdminNotification(`❌ *Group Denied*\n\nGroup ID: ${groupId}\nDenied by: ${msg.from.first_name}`);
+});
+
+// List pending groups
+bot.onText(/\/pendinggroups/, async (msg) => {
+    const userId = msg.from.id.toString();
+    
+    if (!ADMIN_IDS.includes(userId)) {
+        await bot.sendMessage(msg.chat.id, '❌ Admin only command.');
+        return;
+    }
+    
+    const pendingList = Object.keys(pendingGroups);
+    
+    if (pendingList.length === 0) {
+        await bot.sendMessage(msg.chat.id, '📋 No pending group requests.');
+        return;
+    }
+    
+    let message = '*Pending Group Requests:*\n\n';
+    pendingList.forEach((groupId, index) => {
+        const request = pendingGroups[groupId];
+        const time = new Date(request.timestamp).toLocaleString();
+        message += `${index + 1}. Group ID: \`${groupId}\`\n   Requested: ${time}\n`;
+        message += `   Approve: /approvegroup ${groupId}\n`;
+        message += `   Deny: /denygroup ${groupId}\n\n`;
+    });
+    
+    await bot.sendMessage(msg.chat.id, message, { parse_mode: 'Markdown' });
+});
+
+// List approved groups
+bot.onText(/\/approvedgroups/, async (msg) => {
+    const userId = msg.from.id.toString();
+    
+    if (!ADMIN_IDS.includes(userId)) {
+        await bot.sendMessage(msg.chat.id, '❌ Admin only command.');
+        return;
+    }
+    
+    const approvedList = Array.from(approvedGroups);
+    
+    if (approvedList.length === 0) {
+        await bot.sendMessage(msg.chat.id, '📋 No approved groups.');
+        return;
+    }
+    
+    let message = '*Approved Groups:*\n\n';
+    approvedList.forEach((groupId, index) => {
+        message += `${index + 1}. \`${groupId}\`\n`;
+    });
+    
+    await bot.sendMessage(msg.chat.id, message, { parse_mode: 'Markdown' });
+});
 
 // Manual verification for users
 bot.onText(/\/verify (\d+)/, async (msg, match) => {
@@ -828,7 +961,6 @@ bot.on('callback_query', async (callbackQuery) => {
         } else {
             await bot.answerCallbackQuery(callbackQuery.id, '❌ Verification failed. Please try again.');
             
-            // Give detailed instructions
             const failMessage = `⚠️ *Unable to verify your membership automatically.*\n\n` +
                 `Please try these steps:\n` +
                 `1️⃣ Click the "Join Channel" button below\n` +
@@ -841,7 +973,6 @@ bot.on('callback_query', async (callbackQuery) => {
             
             await bot.sendMessage(chatId, failMessage, { parse_mode: 'Markdown' });
             
-            // Send notification to admins about verification issue
             sendAdminNotification(
                 `⚠️ *Verification Issue*\n\n` +
                 `User: ${callbackQuery.from.first_name}\n` +
@@ -872,9 +1003,13 @@ Activity Limit: 15 minutes
 /help - Show this message
 
 *Admin Commands:*
-/verify [user_id] - Manually verify a user
-/unverify [user_id] - Unverify a user
-/listverified - List all verified users
+📋 /pendinggroups - List groups waiting for approval
+✅ /approvegroup [group_id] - Approve a group
+❌ /denygroup [group_id] - Deny a group
+📊 /approvedgroups - List all approved groups
+👤 /verify [user_id] - Manually verify a user
+👤 /unverify [user_id] - Unverify a user
+📋 /listverified - List all verified users
 
 *Buttons:*
 上班 - Start work
@@ -883,10 +1018,9 @@ Activity Limit: 15 minutes
 返回 - Return from break
 
 *Verification:*
-- Groups: Must be allowed by admin
+- Groups: Must be approved by admin
 - Personal: Must join referral channel
-- Admins: Auto-verified
-- Admins can manually verify users with /verify`;
+- Admins: Auto-verified`;
     try {
         await bot.sendMessage(chatId, helpMessage, { parse_mode: 'Markdown' });
     } catch (error) {
@@ -899,10 +1033,9 @@ bot.onText(/\/start/, async (msg) => {
     const isGroupChat = isGroup(msg.chat);
     
     if (isGroupChat) {
-        if (!isGroupAllowed(chatId)) {
-            try {
-                await bot.sendMessage(chatId, '❌ This group is not authorized to use this bot. Please contact the administrator.');
-            } catch (e) {}
+        // Group verification will be handled by verifyUserAndGroup
+        const verified = await verifyUserAndGroup(msg);
+        if (!verified) {
             return;
         }
         
@@ -1121,7 +1254,6 @@ bot.onText(/上班/, async (msg) => {
             if (late) {
                 const lateDurationText = formatDurationWithSeconds(getLateDuration(now));
                 response += `\n\n⚠️ You are late!\n⏱️ Late by: ${lateDurationText}`;
-                // ✅ Only send to admins
                 await sendAdminNotification(`⚠️ LATE ARRIVAL\n\n${mentionUser(name, telegramId)} started work at ${actualTimeFormatted}\nLate by: ${lateDurationText}`, 'Markdown');
             } else {
                 console.log(`[ON TIME] ${name} started at ${actualTimeFormatted}`);
@@ -1179,7 +1311,6 @@ bot.onText(/下班/, async (msg) => {
             const response = `✅ ${name} finished work\n\n📊 Work Summary:\n⏱️ Work Duration: ${formatDurationWithSeconds(workDurationMs)}\n⏱️ Break Time: ${formatDurationWithSeconds(totalBreaks)}`;
             await bot.sendMessage(chatId, response, { parse_mode: 'Markdown', ...mainKeyboard });
             
-            // ✅ Send summary only to admins
             await sendAdminNotification(`📊 *Work Summary*\n\n${mentionUser(name, telegramId)}\n⏱️ Work Duration: ${formatDurationWithSeconds(workDurationMs)}\n⏱️ Break Time: ${formatDurationWithSeconds(totalBreaks)}`, 'Markdown');
         } catch (error) {
             console.error('Error in 下班:', error);
@@ -1264,7 +1395,6 @@ bot.onText(/返回/, async (msg) => {
             const response = `✅ ${name} returned\n\n📊 Activity: ${activityDisplay}\n⏱️ Duration: ${formatDurationWithSeconds(durationMs)}`;
             await bot.sendMessage(chatId, response, { parse_mode: 'Markdown', ...mainKeyboard });
             
-            // ✅ Send break summary only to admins
             await sendAdminNotification(`⏱️ *Break Summary*\n\n${mentionUser(name, telegramId)}\n📊 ${activityDisplay}: ${formatDurationWithSeconds(durationMs)}`, 'Markdown');
         } catch (error) {
             console.error('Error in 返回:', error);
@@ -1321,14 +1451,14 @@ process.on('SIGINT', () => {
 });
 
 // ==================== STARTUP ====================
-console.log('🚀 Starting Employee Attendance Bot v3.5');
+console.log('🚀 Starting Employee Attendance Bot v3.6');
 console.log('================================================');
 console.log(`✅ Timezone: ${MEXICO_TIMEZONE}`);
 console.log(`✅ Work start: ${WORK_START_HOUR}:${WORK_START_MINUTE} AM`);
 console.log(`✅ Late threshold: ${LATE_THRESHOLD_MINUTES} minutes`);
 console.log(`✅ Admins: ${ADMIN_IDS.length > 0 ? ADMIN_IDS.join(', ') : 'None'}`);
 console.log(`✅ Group Chat: ${GROUP_CHAT_ID || 'Not set'}`);
-console.log(`✅ Allowed Groups: ${ALLOWED_GROUP_IDS.length > 0 ? ALLOWED_GROUP_IDS.join(', ') : 'All groups allowed'}`);
+console.log(`✅ Pre-approved Groups: ${approvedGroups.size > 0 ? Array.from(approvedGroups).join(', ') : 'None'}`);
 console.log(`✅ Referral Channel: ${REFERRAL_CHANNEL_ID || 'Not set'}`);
 console.log(`✅ API URL: ${TELEGRAM_API_URL}`);
 console.log(`✅ Proxy: ${PROXY_URL || 'Not set'}`);
