@@ -30,7 +30,7 @@ const superAdmins = new Set(SUPER_ADMIN_IDS);
 // Normal admins: each can only have ONE active group
 const normalAdmins = new Map(); // adminId -> groupId
 const adminGroups = new Map(); // groupId -> adminId
-const approvedGroups = new Set();
+const approvedGroups = new Set(); // Store as strings
 const pendingGroups = {}; // groupId -> { timestamp, chatId, adminId }
 const groupApprovedBy = new Map(); // groupId -> adminId
 
@@ -253,7 +253,7 @@ app.get('/health', (req, res) => {
         pendingGroups: Object.keys(pendingGroups).length,
         normalAdmins: normalAdmins.size,
         superAdmins: superAdmins.size,
-        version: '4.1',
+        version: '4.2',
         connection: {
             status: pollingActive ? 'connected' : 'disconnected',
             proxy: PROXY_URL ? 'configured' : 'none',
@@ -410,7 +410,11 @@ async function isUserMemberOfChannel(userId) {
 }
 
 function isGroupAllowed(groupId) {
-    return approvedGroups.has(groupId);
+    // Convert to string for consistent comparison
+    const groupIdStr = groupId.toString();
+    const result = approvedGroups.has(groupIdStr);
+    console.log(`[GROUP CHECK] Group ${groupIdStr} approved: ${result}`);
+    return result;
 }
 
 function isGroup(chat) {
@@ -453,11 +457,13 @@ async function sendVerificationRequest(chatId, userId) {
     }
 }
 
-async function verifyGroupAndUsers(msg) {
+async function verifyUserAndGroup(msg) {
     const chatId = msg.chat.id;
     const userId = msg.from ? msg.from.id.toString() : null;
     const isGroupChat = isGroup(msg.chat);
     const groupIdStr = chatId.toString();
+    
+    console.log(`[VERIFY] Chat: ${chatId}, User: ${userId}, IsGroup: ${isGroupChat}`);
     
     // If it's not a group chat, just verify the user
     if (!isGroupChat) {
@@ -490,21 +496,25 @@ async function verifyGroupAndUsers(msg) {
     
     // GROUP CHAT - Check if group is approved
     if (approvedGroups.has(groupIdStr)) {
+        console.log(`[VERIFY] Group ${groupIdStr} is APPROVED - allowing all users`);
         // Group is approved - auto-verify all users in this group
         if (userId) {
             verifiedUsers.add(userId);
-            console.log(`[VERIFICATION] Auto-verified user ${userId} in approved group ${chatId}`);
+            console.log(`[VERIFY] Auto-verified user ${userId} in approved group ${chatId}`);
         }
         return true;
     }
     
     // Check if group is pending
     if (pendingGroups[groupIdStr]) {
+        console.log(`[VERIFY] Group ${groupIdStr} is PENDING`);
         try {
             await bot.sendMessage(chatId, '⏳ *Your group is pending admin approval.*\n\nPlease wait for the admin to approve this group.', { parse_mode: 'Markdown' });
         } catch (e) {}
         return false;
     }
+    
+    console.log(`[VERIFY] Group ${groupIdStr} is NEW - checking admin status`);
     
     // New group - only admins can request approval
     if (userId && isAdmin(userId)) {
@@ -881,6 +891,7 @@ bot.onText(/\/approvegroup (.+)/, async (msg, match) => {
         // Try to approve it anyway - maybe it's already working
         // Check if the group exists and we can send a message to it
         try {
+            // Send approval message to group
             await bot.sendMessage(groupId, '✅ *Group Approved!*\n\nThis group has been approved and can now use the bot.\n\nUse the buttons below to start tracking attendance.', { 
                 parse_mode: 'Markdown',
                 ...mainKeyboard 
@@ -901,6 +912,7 @@ bot.onText(/\/approvegroup (.+)/, async (msg, match) => {
             const adminType = isSuperAdmin(userId) ? 'Super Admin' : 'Admin';
             await bot.sendMessage(msg.chat.id, `✅ Group ${groupId} has been approved by ${adminType}!`);
             await sendAdminNotification(`✅ *Group Approved*\n\nGroup ID: ${groupId}\nApproved by: ${msg.from.first_name}\nAdmin Type: ${adminType}`);
+            console.log(`[APPROVE] Group ${groupId} approved successfully`);
             return;
         } catch (err) {
             await bot.sendMessage(msg.chat.id, `❌ Group ${groupId} is not pending approval.\n\nTo request approval:\n1. Add bot to the group\n2. Send /start in the group`);
@@ -950,6 +962,7 @@ bot.onText(/\/approvegroup (.+)/, async (msg, match) => {
     }
     
     await sendAdminNotification(`✅ *Group Approved*\n\nGroup ID: ${groupId}\nApproved by: ${msg.from.first_name}\nAdmin Type: ${adminType}`);
+    console.log(`[APPROVE] Group ${groupId} approved successfully by ${adminType}`);
 });
 
 // Deny a group
@@ -1399,7 +1412,7 @@ bot.onText(/\/start/, async (msg) => {
     
     if (isGroupChat) {
         // Use the new verification function that handles groups properly
-        const verified = await verifyGroupAndUsers(msg);
+        const verified = await verifyUserAndGroup(msg);
         if (!verified) {
             return;
         }
@@ -1412,7 +1425,7 @@ bot.onText(/\/start/, async (msg) => {
     }
     
     // Personal chat - verify user
-    const verified = await verifyGroupAndUsers(msg);
+    const verified = await verifyUserAndGroup(msg);
     if (!verified) {
         return;
     }
@@ -1460,7 +1473,7 @@ bot.onText(/\/status/, async (msg) => {
     }
     
     if (!isGroupChat) {
-        const verified = await verifyGroupAndUsers(msg);
+        const verified = await verifyUserAndGroup(msg);
         if (!verified) return;
     }
     
@@ -1579,7 +1592,7 @@ bot.onText(/\/report/, async (msg) => {
     }
     
     if (!isGroupChat) {
-        const verified = await verifyGroupAndUsers(msg);
+        const verified = await verifyUserAndGroup(msg);
         if (!verified) return;
     }
     
@@ -1683,6 +1696,8 @@ async function handleButtonWithVerification(msg, callback) {
     const isGroupChat = isGroup(msg.chat);
     const userId = msg.from ? msg.from.id.toString() : null;
     
+    console.log(`[BUTTON] Chat: ${chatId}, User: ${userId}, IsGroup: ${isGroupChat}`);
+    
     // Admins bypass verification
     if (userId && isAdmin(userId)) {
         console.log(`[BUTTON] Admin ${userId} bypassed verification`);
@@ -1692,22 +1707,29 @@ async function handleButtonWithVerification(msg, callback) {
     
     // Group chat - check if group is approved
     if (isGroupChat) {
-        if (!isGroupAllowed(chatId)) {
+        const groupIdStr = chatId.toString();
+        const isApproved = approvedGroups.has(groupIdStr);
+        console.log(`[BUTTON] Group ${groupIdStr} approved: ${isApproved}`);
+        
+        if (!isApproved) {
             try {
-                await bot.sendMessage(chatId, '❌ This group is not authorized to use this bot.');
-            } catch (e) {}
+                await bot.sendMessage(chatId, '❌ This group is not authorized to use this bot.\n\nPlease contact an admin to approve this group.');
+            } catch (e) {
+                console.log('Failed to send unauthorized message');
+            }
             return;
         }
         // ✅ Auto-verify all users in approved groups
         if (userId) {
             verifiedUsers.add(userId);
+            console.log(`[BUTTON] Auto-verified user ${userId} in approved group`);
         }
         await callback();
         return;
     }
     
     // Personal chat - verify user
-    const verified = await verifyGroupAndUsers(msg);
+    const verified = await verifyUserAndGroup(msg);
     if (!verified) return;
     await callback();
 }
@@ -1972,7 +1994,7 @@ process.on('SIGINT', () => {
 });
 
 // ==================== STARTUP ====================
-console.log('🚀 Starting Employee Attendance Bot v4.1');
+console.log('🚀 Starting Employee Attendance Bot v4.2');
 console.log('================================================');
 console.log(`✅ Timezone: ${MEXICO_TIMEZONE}`);
 console.log(`✅ Work start: ${WORK_START_HOUR}:${WORK_START_MINUTE} AM`);
